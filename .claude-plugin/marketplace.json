@@ -1,0 +1,13 @@
+{
+  "name": "marques-local",
+  "description": "Local marketplace for the opencode agent monitor mod.",
+  "owner": { "name": "Marques" },
+  "plugins": [
+    {
+      "name": "opencode-agent-monitor",
+      "source": "./",
+      "description": "Live view of this session's opencode subagents",
+      "author": { "name": "Marques" }
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 import type { AgentStatus, TrackedAgent } from '../types'
-import { isActive } from './summary'
+import { isActive, isSettled } from './summary'
 
 // The last match wins: an agent's report comes first and may quote another result.
 const RESULT_ID = /^agent_id: (ses_[A-Za-z0-9]+) \(/gm
@@ -56,14 +56,45 @@ export const agentsToWake = (
   inFlight: string[],
 ): string[] =>
   next
-    .filter(s => s.state === 'finished' && isActive(s.id, previous))
+    .filter(s => (s.state === 'finished' || s.state === 'asking') && isActive(s.id, previous))
     .map(s => s.id)
     .filter(id => !delivered.includes(id) && !inFlight.includes(id))
+
+// Every agent question goes to the person; Claude never answers one on its own.
+export const PICKER_RULE =
+  'Ask the user with the AskUserQuestion option picker, for every question, even if you think you know the answer. Use the options the agent listed, with its first as the recommendation; write your own only if it listed none. Then relay their answer with the MCP send_message tool on this same agent_id.'
+
+const openTasks = (s: AgentStatus) => (s.tasks ?? []).filter(t => !isSettled(t)).map(t => t.content)
+
+const unfinishedText = (s: AgentStatus) =>
+  `opencode agent ${s.id} (${s.title}) stopped with tasks still open: ${openTasks(s).join('; ')}. Collect its result with the MCP wait tool, then use send_message on this same agent_id to make it finish them. If it cannot, tell the user why.`
 
 export const wakeText = (ids: string[], statuses: AgentStatus[]) =>
   statuses
     .filter(s => ids.includes(s.id))
-    .map(s => `opencode agent ${s.id} (${s.title}) finished. Collect its result with the MCP wait tool and continue.`)
+    .map(s => {
+      if (s.state === 'asking') {
+        return `opencode agent ${s.id} (${s.title}) is asking:\n${s.question}\n${PICKER_RULE} It stays blocked until you do.`
+      }
+
+      return openTasks(s).length
+        ? unfinishedText(s)
+        : `opencode agent ${s.id} (${s.title}) finished. Collect its result with the MCP wait tool and continue.`
+    })
+    .join('\n')
+
+// shortcut: repeats on each user message until the agent moves on or is stopped; add a
+// dismiss if abandoned agents make it noisy. Agents with a call in flight are already moving.
+export const pendingText = (statuses: AgentStatus[], inFlight: string[]) =>
+  statuses
+    .filter(s => !inFlight.includes(s.id))
+    .flatMap(s => {
+      if (s.state === 'asking') {
+        return `opencode agent ${s.id} (${s.title}) is blocked on this question:\n${s.question}\nIf this message answers it, relay the answer now with the MCP send_message tool on this same agent_id, and keep the agent going until its tasks are done. If not: ${PICKER_RULE} A reply in chat alone never reaches it.`
+      }
+
+      return s.state === 'finished' && openTasks(s).length ? unfinishedText(s) : []
+    })
     .join('\n')
 
 // A call left this agent running, so a finish seen while the call was in flight, or
