@@ -47,3 +47,49 @@ test('failures are values', async () => {
   }
   expect(await createDb({ process: { run } }).fetchRows(['ses_a'])).toEqual({ ok: false, error: 'cannot start' })
 })
+
+test('history rejects a bad id and reports failures as values', async () => {
+  const { calls, db } = fake()
+
+  expect((await db.fetchHistory("x' or 1=1")).ok).toBe(false)
+  expect(calls.length).toBe(0)
+  expect((await fake('', 1).db.fetchHistory('ses_a')).ok).toBe(false)
+})
+
+test('prompts reject a bad id and report failures as values', async () => {
+  const { calls, db } = fake('[{"message_id":"m","role":"user","text":"hi","time_created":1}]')
+
+  expect((await db.fetchPrompts("x' or 1=1")).ok).toBe(false)
+  expect(calls.length).toBe(0)
+  expect((await db.fetchPrompts('ses_a')).ok).toBe(true)
+  expect((await fake('', 1).db.fetchPrompts('ses_a')).ok).toBe(false)
+})
+
+test('history asks for turn figures, reasoning and bounded tool detail', async () => {
+  const { calls, db } = fake(
+    '[{"message_id":"m","part_id":"p","role":"assistant","type":"tool","tool":"bash","status":"completed","title":"ls","text":null,"output":"out","diff":"d","tokens":12,"cost":0.1,"time_created":1,"time_completed":2,"total":1}]',
+  )
+  const found = await db.fetchHistory('ses_a')
+  const sql = calls[1]?.[4] ?? ''
+
+  expect(found).toMatchObject({ ok: true, rows: [{ message_id: 'm', part_id: 'p', output: 'out', tokens: 12 }] })
+  expect(sql).toContain("json_extract(m.data, '$.tokens.total') as tokens")
+  expect(sql).toContain("json_extract(m.data, '$.cost') as cost")
+  expect(sql).toContain("json_extract(m.data, '$.time.completed') as time_completed")
+  expect(sql).toContain("json_extract(p.data, '$.state.output')")
+  expect(sql).toContain("json_extract(p.data, '$.state.metadata.diff')")
+  expect(sql).toContain("'reasoning'")
+  // A user prompt keeps its whole text, task section included; only replies are cut.
+  expect(sql).toMatch(/case when json_extract\(m\.data, '\$\.role'\) = 'user' then json_extract\(p\.data, '\$\.text'\)\s+else substr/)
+})
+
+test('the session rows carry variant and token totals', async () => {
+  const { calls, db } = fake('[]')
+  await db.fetchRows(['ses_a'])
+  const sql = calls.map(c => c[4] ?? '').find(text => text.includes('tokens_input')) ?? ''
+
+  expect(sql).toContain("json_extract(model, '$.variant')")
+  expect(sql).toContain('tokens_input')
+  expect(sql).toContain('tokens_output')
+  expect(sql).toContain('tokens_reasoning')
+})

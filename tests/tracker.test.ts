@@ -8,6 +8,7 @@ import {
   markRunning,
   reportedAgentId,
   resultText,
+  pendingText,
   wakeText,
 } from '../hooks/tracker'
 import type { AgentState } from '../types'
@@ -117,4 +118,37 @@ test('markRunning makes the next finish count', () => {
   const list = markRunning([status('ses_a', 'finished')], 'ses_a')
 
   expect(agentsToWake(list, [status('ses_a', 'finished')], [], [])).toEqual(['ses_a'])
+})
+
+test('an asking agent wakes Claude with its question', () => {
+  const running = { id: 'ses_a', title: 'T', model: '', state: 'running', startedAt: 0, elapsedMs: 0, recent: '', cost: 0 } as const
+  const asking = { ...running, state: 'asking', question: 'which db?' } as const
+
+  expect(agentsToWake([running], [asking], [], [])).toEqual(['ses_a'])
+  expect(agentsToWake([asking], [asking], [], [])).toEqual([])
+  expect(wakeText(['ses_a'], [asking])).toContain('is asking:\nwhich db?\nAsk the user with the AskUserQuestion option picker')
+})
+
+test('open tasks turn a finish into a request to continue the same agent', () => {
+  const tasks = [{ content: 'a', status: 'completed' }, { content: 'b', status: 'pending' }]
+  const open = { ...status('ses_a', 'finished'), tasks }
+
+  expect(wakeText(['ses_a'], [open])).toContain('tasks still open: b.')
+  expect(wakeText(['ses_a'], [open])).toContain('send_message on this same agent_id')
+  expect(wakeText(['ses_a'], [{ ...open, tasks: [tasks[0]] }])).toContain('finished. Collect')
+})
+
+test('pending work names blocked and unfinished agents only', () => {
+  const asking = { ...status('ses_a', 'asking'), question: 'which db?' }
+  const open = { ...status('ses_b', 'finished'), tasks: [{ content: 'b', status: 'in_progress' }] }
+  const list = [asking, open, status('ses_c', 'finished'), status('ses_d', 'running')]
+  const text = pendingText(list, [])
+
+  expect(text).toContain('ses_a')
+  expect(text).toContain('which db?')
+  expect(text).toContain('ses_b')
+  expect(text).not.toContain('ses_c')
+  expect(text).not.toContain('ses_d')
+  expect(text).toContain('AskUserQuestion')
+  expect(pendingText([asking], ['ses_a'])).toBe('')
 })
