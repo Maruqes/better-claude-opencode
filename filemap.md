@@ -8,3 +8,4 @@ hooks/tracker.ts — id extraction and tracked agents (pure)
 hooks/db.ts — read-only opencode database access
 hooks/summary.ts — rows to AgentStatus (pure)
 types/index.d.ts — $.state contract
+tests/pane.test.tsx — pane test

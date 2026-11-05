@@ -1,0 +1,6 @@
+{
+  "name": "better-claude-opencode",
+  "version": "0.1.0",
+  "description": "Live view of this session's opencode subagents",
+  "types": "./types/index.d.ts"
+}
