@@ -39,7 +39,7 @@ type Process = {
 
 const RECENT_PARTS = 10
 const EXCERPT_CHARS = 300
-const SESSION_ID = /^ses_[A-Za-z0-9]+$/
+export const SESSION_ID = /^ses_[A-Za-z0-9]+$/
 
 const quote = (text: string) => `'${text.replaceAll("'", "''")}'`
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e))

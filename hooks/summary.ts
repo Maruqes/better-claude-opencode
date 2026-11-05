@@ -1,18 +1,5 @@
+import type { AgentState, AgentStatus } from '../types'
 import type { MessageRow, PartRow, Rows } from './db'
-
-export type AgentState = 'running' | 'finished' | 'stopped' | 'unknown'
-
-export type AgentStatus = {
-  id: string
-  title: string
-  model: string
-  state: AgentState
-  startedAt: number
-  elapsedMs: number
-  currentTool?: string
-  recent: string
-  cost: number
-}
 
 const RECENT_CHARS = 120
 // opencode keeps looping after these, so the agent has not ended.
@@ -68,3 +55,29 @@ export const summarize = (id: string, rows: Rows, now: number): AgentStatus => {
     cost: session.cost,
   }
 }
+
+export const isActive = (id: string, statuses: AgentStatus[]) => {
+  const state = statuses.find(s => s.id === id)?.state
+
+  return !state || state === 'running' || state === 'unknown'
+}
+
+export const formatElapsed = (ms: number) => {
+  const seconds = Math.floor(ms / 1000)
+
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
+}
+
+export const formatCounts = (statuses: AgentStatus[]) =>
+  (
+    [
+      ['running', 'running'],
+      ['finished', 'done'],
+      ['stopped', 'stopped'],
+      ['unknown', 'unknown'],
+    ] as const
+  )
+    .map(([state, label]) => [statuses.filter(s => s.state === state).length, label] as const)
+    .filter(([count]) => count)
+    .map(([count, label]) => `${count} ${label}`)
+    .join(' · ')

@@ -1,8 +1,4 @@
-export type TrackedAgent = {
-  id: string
-  // Set while adopted from the database, until `callId`'s result names the real id.
-  callId?: string
-}
+import type { TrackedAgent } from '../types'
 
 // The last match wins: an agent's report comes first and may quote another result.
 const RESULT_ID = /^agent_id: (ses_[A-Za-z0-9]+) \(/gm
