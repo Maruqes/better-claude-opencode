@@ -110,7 +110,7 @@ test('a Stop failure has its own row beside the activity warning', async ($, on)
   await ui.unmount()
 })
 
-const engine = (on: any) => {
+const engine = (on: any, every: () => unknown = () => new Promise(() => {})) => {
   const opened: unknown[] = []
   const state = new Map<string, any>()
   on('state.get', (_: unknown, e: { key: string }) => ({
@@ -125,7 +125,7 @@ const engine = (on: any) => {
   on('ui.open', (_: unknown, e: unknown) => (opened.push(e), { value: { isPlaced: true } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('clock.now', () => ({ value: 1000 }))
-  on('clock.every', () => new Promise(() => {}))
+  on('clock.every', every)
 
   return { opened, tracked: () => state.get('tracked')?.value }
 }
@@ -201,4 +201,110 @@ test('the status tool queries fresh rows', async ($, on) => {
   await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
 
   expect((await $.tool.call({ tool: STATUS, agent_id: 'ses_a' })).result).toBe('ses_a  unknown  0m00s  Task')
+})
+
+// A poll per release of the clock; `row` is the agent's newest message.
+const polling = (on: any) => {
+  const ticks: (() => void)[] = []
+  const base = engine(on, () => new Promise<{ value: undefined }>(r => ticks.push(() => r({ value: undefined }))))
+  const prompts: string[] = []
+  const live = { refuses: false, row: { session_id: 'ses_a', role: 'assistant', completed: null as number | null, finish: 'stop' } }
+  on('session.cwd', () => ({ value: '/' }))
+  on('prompt.submit', (_: unknown, e: { text: string }) => {
+    if (live.refuses) throw new Error('refused')
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  running(on, argv => {
+    const sql = argv.at(-1) ?? ''
+    const session = { id: 'ses_a', title: 'Task', model: 'm', cost: 0, time_created: 0, time_updated: 0, run_started: 0 }
+    const rows = sql.includes('from session where id') ? [session] : sql.includes('from message where') ? [live.row] : []
+    return { exitCode: 0, stdout: argv[0] === 'opencode' ? '/db' : JSON.stringify(rows), stderr: '' }
+  })
+  // The contract types have no timers, but the test runner does.
+  const settle = () => new Promise(r => (globalThis as any).setTimeout(r, 10))
+  const tick = async () => {
+    await settle()
+    ticks.shift()?.()
+    await settle()
+  }
+
+  return { ...base, prompts, live, tick }
+}
+
+test('a background agent wakes Claude exactly once when it finishes', async ($, on) => {
+  const { prompts, live, tick } = polling(on)
+  const answer = { result: {}, text: 'Started agent ses_a in the background ("x", m). Use wait to collect the result.' }
+  ;(on as any)('tool.call', () => answer)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
+
+  await tick()
+  expect(prompts).toEqual([])
+  live.row.completed = 5
+  await tick()
+  await tick()
+  expect(prompts).toEqual([
+    'opencode agent ses_a (Task) finished. Collect its result with the MCP wait tool and continue.',
+  ])
+})
+
+test('a result Claude received gets no wake, until send_message runs it again', async ($, on) => {
+  const { prompts, live, tick } = polling(on)
+  const report = 'Done\n\n---\nagent_id: ses_a (continue it with send_message)\nstatus: completed'
+  let text = 'Started agent ses_a in the background ("x", m). Use wait to collect the result.'
+  ;(on as any)('tool.call', () => ({ result: {}, text }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
+  await tick()
+
+  text = report
+  await $.tool.call({ tool: `${TOOL}wait`, agent_id: 'ses_a' })
+  live.row.completed = 5
+  await tick()
+  await tick()
+  expect(prompts).toEqual([])
+
+  text = 'Resumed agent ses_a in the background.'
+  await $.tool.call({ tool: `${TOOL}send_message`, agent_id: 'ses_a', message: 'more' })
+  await tick()
+  await tick()
+  expect(prompts.length).toBe(1)
+})
+
+test('a wait timeout is not a delivery, even when the finish came during the call', async ($, on) => {
+  const { prompts, live, tick } = polling(on)
+  let release = () => {}
+  ;(on as any)('tool.call', () =>
+    new Promise(r => {
+      release = () => r({ result: {}, text: 'Agent ses_a is still running.\n- ses_a [running] "x"' })
+    }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const call = $.tool.call({ tool: `${TOOL}wait`, agent_id: 'ses_a' })
+  await tick()
+  live.row.completed = 5
+  await tick()
+  expect(prompts).toEqual([])
+
+  release()
+  await call
+  await tick()
+  expect(prompts.length).toBe(1)
+})
+
+test('a failed wake warns and polling goes on', async ($, on) => {
+  const { prompts, live, tick } = polling(on)
+  live.refuses = true
+  ;(on as any)('tool.call', () => ({ result: {}, text: 'Started agent ses_a in the background ("x", m).' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
+  await tick()
+  live.row.completed = 5
+  await tick()
+  live.refuses = false
+  await tick()
+
+  const after = await $.tool.call({ tool: STATUS })
+  expect(String(after.result)).toContain('ses_a  finished')
+  expect(prompts).toEqual([])
 })

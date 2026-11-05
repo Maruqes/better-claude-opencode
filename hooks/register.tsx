@@ -4,7 +4,17 @@ import type { Register } from 'claude-code'
 import type { AgentState, AgentStatus, TrackedAgent } from '../types'
 import { createDb, SESSION_ID } from './db'
 import { formatCounts, formatElapsed, formatReport, isActive, summarize } from './summary'
-import { addAgent, adoptProvisional, confirmAgent, extractAgentId, resultText } from './tracker'
+import {
+  addAgent,
+  adoptProvisional,
+  agentsToWake,
+  confirmAgent,
+  extractAgentId,
+  markRunning,
+  reportedAgentId,
+  resultText,
+  wakeText,
+} from './tracker'
 
 const PANE = 'opencode-agents'
 const TITLE = 'opencode agents'
@@ -17,6 +27,7 @@ const NO_ROWS = { sessions: [], messages: [], parts: [] }
 
 const tracked = atom({ plugin: 'better-claude-opencode', key: 'tracked' } as const, [], { shape: 'tracked-1' })
 const statuses = atom({ plugin: 'better-claude-opencode', key: 'statuses' } as const, [], { shape: 'statuses-1' })
+const delivered = atom({ plugin: 'better-claude-opencode', key: 'delivered' } as const, [], { shape: 'delivered-1' })
 const warning = atom({ plugin: 'better-claude-opencode', key: 'warning' } as const, '')
 const stopError = atom({ plugin: 'better-claude-opencode', key: 'stopError' } as const, '')
 
@@ -30,7 +41,7 @@ export const register: Register = on => {
     startPolling(): void
     fetchRows: ReturnType<typeof createDb>['fetchRows']
   }
-  const calls = new Map<string, { start: number; adopts: boolean }>()
+  const calls = new Map<string, { start: number; adopts: boolean; id?: string }>()
   // A call ended during a poll, so that poll's view is stale: poll once more.
   let isStale = false
 
@@ -67,10 +78,31 @@ export const register: Register = on => {
         const now = await $.clock.now()
         for (const id of ids) if (!firstSeen.has(id)) firstSeen.set(id, now)
         const rows = await db.fetchRows(ids)
-        if (rows.ok) {
-          await update($, statuses, () => ids.map(id => summarize(id, rows, now)))
-        } else error ??= rows.error
+        let wake: string[] = []
+        // Rows read before a call ended are stale, and could wake for the wrong run.
+        if (rows.ok && !isStale) {
+          const previous = await read($, statuses)
+          const current = await update($, statuses, () => ids.map(id => summarize(id, rows, now)))
+          const list = await read($, tracked)
+          const received = await read($, delivered)
+          // After the reads: a call writes `delivered` before it leaves `calls`.
+          const inFlight = [
+            ...[...calls.values()].flatMap(c => c.id ?? []),
+            ...list.filter(a => a.callId && calls.has(a.callId)).map(a => a.id),
+          ]
+          wake = agentsToWake(previous, current, received, inFlight)
+          if (wake.length) await update($, delivered, done => [...done, ...wake])
+        } else if (!rows.ok) error ??= rows.error
         await update($, warning, () => (error ? `Activity unavailable: ${error}` : ''))
+        if (wake.length) {
+          const failed = (reason: unknown) => update($, warning, () => `Wake failed: ${errorText(reason)}`)
+          // Not awaited: a submit resolves when its turn starts, which must not hold up polling.
+          void $.prompt
+            .submit({ text: wakeText(wake, await read($, statuses)) })
+            .then(result => (result.drop === undefined ? undefined : failed(result.drop)))
+            .catch(failed)
+            .catch(() => {})
+        }
 
         const known = await read($, statuses)
         const isIdle = !(await read($, tracked)).some(a =>
@@ -142,11 +174,11 @@ export const register: Register = on => {
   for (const name of ['agent', 'send_message', 'wait']) {
     on('tool.call', { tool: `${TOOL_PREFIX}${name}` }, async ($, e, next) => {
       const callId = e.tool_use_id
-      calls.set(callId, { start: await $.clock.now(), adopts: name === 'agent' })
       const { agent_id: id } = e as { agent_id?: unknown }
-      if (name !== 'agent' && typeof id === 'string' && SESSION_ID.test(id)) {
-        await tracking.track(list => addAgent(list, id))
-      }
+      const known = name !== 'agent' && typeof id === 'string' && SESSION_ID.test(id) ? id : undefined
+      calls.set(callId, { start: await $.clock.now(), adopts: name === 'agent', ...(known && { id: known }) })
+      if (known) await tracking.track(list => addAgent(list, known))
+      if (known && name === 'send_message') await update($, delivered, list => list.filter(d => d !== known))
       tracking.startPolling()
 
       let text: string | undefined
@@ -156,9 +188,13 @@ export const register: Register = on => {
 
         return ran
       } finally {
+        const resultId = text && extractAgentId(text)
+        const reported = text && reportedAgentId(text)
+        if (reported) await update($, delivered, list => [...list.filter(d => d !== reported), reported])
         calls.delete(callId)
         isStale = true
-        await tracking.track(list => confirmAgent(list, callId, text && extractAgentId(text)))
+        if (resultId && !reported) await update($, statuses, list => markRunning(list, resultId))
+        await tracking.track(list => confirmAgent(list, callId, resultId))
         tracking.startPolling()
       }
     })

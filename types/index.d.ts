@@ -26,6 +26,8 @@ declare module 'claude-code' {
     'better-claude-opencode': {
       tracked: Shaped<TrackedAgent[]>
       statuses: Shaped<OpencodeStatus[]>
+      // Agents whose result Claude already received, so they get no wake.
+      delivered: Shaped<string[]>
       warning: string
       stopError: string
     }
