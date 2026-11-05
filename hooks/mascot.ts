@@ -59,3 +59,40 @@ export const robotSvg = (effort: Effort, state: RobotState, size = 32): string =
     '</g></svg>'
   )
 }
+
+// A slim rounded bar; the fill never gets narrower than its own round cap.
+// Empty pixels above the bar: a Box margin could only move it a whole text row.
+export const PROGRESS_TOP = 3
+
+export const progressSvg = (width: number, percent: number, height = 6): string => {
+  const fill = percent > 0 ? Math.max(height, Math.round((width * Math.min(percent, 100)) / 100)) : 0
+
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height + PROGRESS_TOP}" viewBox="0 0 ${width} ${height + PROGRESS_TOP}">` +
+    `<rect width="${width}" height="${height}" rx="${height / 2}" fill="#8A8F98" fill-opacity=".28" y="${PROGRESS_TOP}"/>` +
+    (fill ? `<rect width="${fill}" height="${height}" rx="${height / 2}" fill="${TIER.medium}" y="${PROGRESS_TOP}"/>` : '') +
+    '</svg>'
+  )
+}
+
+const escapeXml = (text: string) =>
+  text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c] as string)
+
+// Text rows that dissolve to transparent at the bottom: a luminance mask, so no theme background is needed.
+// shortcut: colours follow prefers-color-scheme only, not the app theme, and the text is not selectable; upgrade if themes can be read.
+export const fadedTextSvg = (rows: string[], width: number, rowHeight = 18): string => {
+  const height = rows.length * rowHeight
+  const lines = rows
+    .map((row, n) => `<text x="0" y="${n * rowHeight + rowHeight - 5}" xml:space="preserve">${escapeXml(row)}</text>`)
+    .join('')
+
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
+    '<style>text{font:13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#3B4048}' +
+    '@media (prefers-color-scheme:dark){text{fill:#D4D7DC}}</style>' +
+    '<defs><linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#fff"/><stop offset=".4" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient>' +
+    `<mask id="m"><rect width="${width}" height="${height}" fill="url(#fade)"/></mask></defs>` +
+    `<g mask="url(#m)">${lines}</g></svg>`
+  )
+}

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { MessageRow, PartRow, Rows } from '../hooks/db'
-import { clipText, composePrompt, formatChat, formatProgress, formatPrompts, formatReport, groupChat, isActive, parseQuestion, progressOf, QUESTION_RULE, summarize } from '../hooks/summary'
+import { clipText, composePrompt, formatChat, formatProgress, formatPrompts, formatReport, groupChat, isActive, parseQuestion, progressOf, QUESTION_RULE, summarize, wrapRows } from '../hooks/summary'
 
 const ID = 'ses_e547fb5b1ffesqEyfSptqG038W'
 const SESSION = {
@@ -237,7 +237,7 @@ test('groupChat opens each assistant message with one turn line', () => {
 
   expect(items.map(item => item.kind)).toEqual(['prompt', 'turn', 'reasoning', 'steps', 'reply', 'turn', 'steps'])
   expect(items[1]).toEqual({ kind: 'turn', id: 'turn-a1', tokens: 1200, cost: 0.004, durationMs: 12_000, index: 1 })
-  expect(items[2]).toEqual({ kind: 'reasoning', id: 'reasoning-r', text: 'Why\nbecause', lines: 2 })
+  expect(items[2]).toEqual({ kind: 'reasoning', id: 'reasoning-r', text: 'Why\nbecause' })
   expect(items[5]).toEqual({ kind: 'turn', id: 'turn-a2', tokens: 300, cost: 0.001, index: 2 })
 })
 
@@ -281,4 +281,9 @@ test('formatPrompts labels answers and follow-ups', () => {
     'first\nmore\n\n## Answer (1970-01-01T00:00:01.000Z)\n\nbecause\n\n## Follow-up (1970-01-01T00:00:02.000Z)\n\nagain\n',
   )
   expect(formatPrompts([])).toBe('')
+})
+
+test('wrapRows splits by columns, keeps blank lines and stops at the row limit', () => {
+  expect(wrapRows('abcdef\n\ngh', 4, 10)).toEqual(['abcd', 'ef', '', 'gh'])
+  expect(wrapRows('a\nb\nc', 4, 2)).toEqual(['a', 'b'])
 })

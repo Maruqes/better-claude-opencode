@@ -182,7 +182,9 @@ export const createDb = ($: Process) => {
             json_extract(p.data, '$.tool') as tool,
             json_extract(p.data, '$.state.status') as status,
             substr(json_extract(p.data, '$.state.title'), 1, ${EXCERPT_CHARS}) as title,
-            substr(json_extract(p.data, '$.text'), 1, ${HISTORY_CHARS}) as text,
+            -- a user prompt is shown whole; only replies are cut
+            case when json_extract(m.data, '$.role') = 'user' then json_extract(p.data, '$.text')
+              else substr(json_extract(p.data, '$.text'), 1, ${HISTORY_CHARS}) end as text,
             substr(json_extract(p.data, '$.state.output'), 1, ${OUTPUT_CHARS}) as output,
             substr(json_extract(p.data, '$.state.metadata.diff'), 1, ${DIFF_CHARS}) as diff,
             json_extract(m.data, '$.tokens.total') as tokens,

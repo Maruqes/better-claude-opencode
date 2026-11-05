@@ -56,8 +56,8 @@ test('the pane draws each state and the warning', async ($, on) => {
     expect(await text(/^■/)).toBe('■')
     expect(await text(/^\?/)).toBe('?')
     expect(await text(/^Task ses_r/)).toBe('Task ses_r')
-    expect(await text(/^deepseek-flash/)).toBe('deepseek-flash · 1m12s · bash')
-    expect((await ui.findAll({ type: 'Text', text: /pytest/ })).length).toBe(1)
+    expect(await text(/^· deepseek-flash/)).toBe('· deepseek-flash · 1m12s · bash')
+    expect((await ui.findAll({ type: 'Text', text: /pytest/ })).length).toBe(0)
     expect(await text(/^!/)).toBe('! Activity unavailable: boom')
     expect(await ui.find({ key: 'stop-ses_r' })).toBeDefined()
     expect(await ui.find({ key: 'stop-ses_f' })).toBeUndefined()
@@ -328,8 +328,8 @@ test('the progress bar is a filled track on every surface, with a gap between th
     const ui = await $.ui.mount({ ...PANE, surface })
     const bar = await ui.find({ key: 'bar-ses_r' })
 
-    expect(JSON.stringify(bar)).toContain('"75%"')
-    expect((await ui.find({ type: 'Text', text: /^1\/2/ }))?.text).toBe('1/2 Two')
+    expect(JSON.stringify(bar)).toContain(surface === 'terminal' ? '"75%"' : '75% done')
+    expect((await ui.find({ type: 'Text', text: /1\/2/ }))?.text).toBe('· deepseek-flash · 1m12s · 1/2')
     expect(JSON.stringify(await ui.findAll({ type: 'Text', text: /^[*█░]+$/ }))).toBe('[]')
     const open = await ui.find({ key: 'open-ses_r' })
     expect(open).toBeDefined()
@@ -365,14 +365,14 @@ test('Open shows the task list and the chat in order; Close hides them', async (
 
     return found.map(f => f.text)
   }
-  const press = async (key: string) => {
-    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const press = async (key: string, target: object = PANE) => {
+    const ui = await $.ui.mount({ ...target, surface: 'desktop' } as any)
     await ui.press({ key })
     await tick()
     await ui.unmount()
   }
 
-  expect(await shown(/^0\/1/)).toEqual(["0/1 Fix it"])
+  expect(await shown(/Fix it/)).toEqual([])
   expect(await shown(/^bash/)).toEqual([])
 
   await press('open-ses_a')
@@ -383,8 +383,15 @@ test('Open shows the task list and the chat in order; Close hides them', async (
   expect(await shown(/hidden/)).toEqual(['Earlier activity hidden · showing the latest 3'])
   // The chat owns the pane: the header says what runs, the checklist waits behind its button.
   expect(await shown(/^opencode agents/)).toEqual([])
-  expect(await shown(/^Fix it/)).toEqual(['Fix it'])
   expect(await shown(/● Fix it/)).toEqual([])
+  const inBand = async (t: RegExp) => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+    const found = await ui.findAll({ type: 'Text', text: t } as any)
+    await ui.unmount()
+
+    return found.map(f => f.text)
+  }
+  expect(await inBand(/^Fix it/)).toEqual(['Fix it'])
   // The harness has no ui.scroll implementation: the call is denied, and the pane goes on without a warning.
   expect(await shown(/^!/)).toEqual([])
 
@@ -398,12 +405,12 @@ test('Open shows the task list and the chat in order; Close hides them', async (
   expect(await shown(/^opencode agents/)).toEqual(['opencode agents'])
 })
 
-test('tool runs fold behind one line, a long prompt behind Show more, and the header is pinned', async ($, on) => {
+test('tool runs fold behind one line, a long prompt behind Show more, and the header is pinned in the pane', async ($, on) => {
   const { live, tick } = polling(on)
   const tool = (t: string) => ({ role: 'assistant', type: 'tool', tool: t, status: 'completed', title: 'x', text: null, total: 3 })
   live.query = sql =>
     sql.includes('count(*) over')
-      ? [tool('edit'), tool('read'), { role: 'user', type: 'text', tool: null, status: null, title: null, text: 'p'.repeat(500), total: 3 }]
+      ? [tool('edit'), tool('read'), { role: 'user', type: 'text', tool: null, status: null, title: null, text: `${'p'.repeat(500)}\n\n# Task\ndo it`, total: 3 }]
       : undefined
   ;(on as any)('tool.call', () => ({ result: {}, text: 'Started agent ses_a in the background ("x", m).' }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
@@ -420,16 +427,22 @@ test('tool runs fold behind one line, a long prompt behind Show more, and the he
   await mounted(ui => ui.press({ key: 'open-ses_a' }))
 
   // Running, so the latest step stays visible under its folded run.
-  expect(await mounted(ui => ui.find({ type: 'Text', text: /^▸ 2 steps: read, edit/ }))).toBeDefined()
+  expect(((await mounted(ui => ui.find({ key: 'steps-1' }))) as any).props.label).toMatch(/^▸ 2 steps: read, edit/)
   expect(await mounted(ui => ui.findAll({ type: 'Text', text: /^(read|edit)  x/ }))).toHaveLength(1)
-  expect(JSON.stringify(await mounted(ui => ui.find({ key: 'chat-header' })))).toContain('"top":7')
+  expect((await mounted(ui => ui.find({ key: 'chat-header' })))?.props.top).toBe(7)
   await mounted(ui => ui.press({ key: 'steps-1' }))
   expect(await mounted(ui => ui.findAll({ type: 'Text', text: /^(read|edit)  x/ }))).toHaveLength(2)
+  expect(((await mounted(ui => ui.find({ key: 'steps-1' }))) as any).props.label).toMatch(/^▾ 2 steps/)
 
-  const prompt = async () => ((await mounted(ui => ui.find({ type: 'Text', text: /^p+/ }))) as any).text.length
-  expect(await prompt()).toBe(108)
+  // Desktop draws the clipped prompt as one fading image; the terminal keeps the stepped text rows.
+  expect(JSON.stringify(await mounted(ui => ui.find({ type: 'Svg' })))).toContain('mask')
+  expect(await mounted(ui => ui.find({ type: 'Text', text: /^p+/ }))).toBeUndefined()
+  const terminal = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, scroll: { offset: 7, bodyRows: 20 } } })
+  expect(((await terminal.find({ type: 'Text', text: /^p+/ })) as any).text.length).toBe(200)
+  await terminal.unmount()
   await mounted(ui => ui.press({ key: 'prompt-0' }))
-  expect(await prompt()).toBe(500)
+  expect(((await mounted(ui => ui.find({ type: 'Text', text: /^p+/ }))) as any).text.length).toBe(514)
+  expect(await mounted(ui => ui.find({ type: 'Text', text: /# Task\ndo it$/ }))).toBeDefined()
 })
 
 test('Jump to latest shows once the person scrolls up, and pressing it resumes following', async ($, on) => {
@@ -515,7 +528,7 @@ test('agent prompts get the template and rule; send_message stays as sent', asyn
   expect(seen[1].message).toBe('more')
 })
 
-test('an asking agent shows its question and prompt path', async ($, on) => {
+test('the list hides agent output; the prompt path moves to the chat view', async ($, on) => {
   seed(on, [agent('ses_q', 'asking', { question: 'which db?' })], undefined, undefined, {
     prompts: { shape: 'prompts-1', value: ['ses_q'] },
   })
@@ -523,9 +536,89 @@ test('an asking agent shows its question and prompt path', async ($, on) => {
   const text = async (t: RegExp) => (await ui.find({ type: 'Text', text: t }))?.text
 
   expect(await text(/asking$/)).toBe('1 asking')
-  expect(await text(/^asking ·/)).toBe('asking · deepseek-flash · 1m12s')
-  expect(await text(/which db/)).toBe('which db?')
-  expect(await text(/prompt\.txt/)).toBe('.opencode-monitor/ses_q/prompt.txt')
+  expect(await text(/^· asking ·/)).toBe('· asking · deepseek-flash · 1m12s')
+  expect(await text(/which db/)).toBeUndefined()
+  expect(await text(/prompt\.txt/)).toBeUndefined()
+  await ui.unmount()
+})
+
+const BAND = {
+  plugin: 'opencode-agent-monitor',
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 40, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+} as const
+const taskPair = [{ content: 'One', status: 'completed' }, { content: 'Two', status: 'in_progress' }]
+
+test('the band shows the open agent header with working buttons, and nothing otherwise', async ($, on) => {
+  let opened = ''
+  // Stands for the engine's own band beneath the plugin.
+  on('ui.render', ($$: any, e: any) => {
+    const { Text } = $$.ui.resolve(e)
+
+    return <Text>engine band</Text>
+  })
+  on('state.get', (_: unknown, e: { key: string }) => {
+    const v = (value: unknown) => ({ value: { value, version: 1 } })
+    if (e.key === 'openAgent') return v(opened)
+    if (e.key === 'tracked') return v({ shape: 'tracked-1', value: [{ id: 'ses_h' }] })
+    if (e.key === 'statuses') return v({ shape: 'statuses-1', value: [agent('ses_h', 'running', { tasks: taskPair })] })
+    return v(e.key === 'prompts' ? { shape: 'prompts-1', value: ['ses_h'] } : e.key === 'chatView' ? { shape: 'chat-view-2', value: { isTasksOpen: false, expanded: [] } } : '')
+  })
+  on('state.set', (_: unknown, e: any) => {
+    if (e.key === 'openAgent') opened = e.value
+    return { value: { isSet: true, version: 1 } }
+  })
+  for (const surface of ['terminal'] as const) {
+    opened = ''
+    const closed = await $.ui.mount({ ...BAND, surface })
+    expect(await closed.find({ key: 'back' })).toBeUndefined()
+    expect(await closed.find({ type: 'Text', text: /engine band/ })).toBeDefined()
+    await closed.unmount()
+
+    opened = 'ses_h'
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ key: 'tasks' })).toBeDefined()
+    expect(await ui.find({ key: 'stop-ses_h' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Task ses_h/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Two/ })).toBeDefined()
+    await ui.press({ key: 'back' })
+    expect(opened).toBe('')
+    await ui.unmount()
+  }
+})
+
+test('every surface but the terminal pins the header in the pane', async ($, on) => {
+  seed(on, [agent('ses_h', 'running', { tasks: taskPair })], undefined, undefined, { openAgent: 'ses_h' })
+  for (const surface of ['vscode', 'mobile', 'terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(!!(await ui.find({ key: 'back' }))).toBe(surface !== 'terminal')
+    await ui.unmount()
+  }
+})
+
+test('open tasks render as full-text wrapping cards in the page, not the header', async ($, on) => {
+  const long = 'Rewrite the whole parser so that every long task description stays fully readable '.repeat(3).trim()
+  seed(on, [agent('ses_h', 'running', { tasks: [{ content: long, status: 'in_progress' }] })], undefined, undefined, {
+    openAgent: 'ses_h',
+    chatView: { shape: 'chat-view-2', value: { isTasksOpen: true, expanded: [] } },
+  })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const t = (await ui.find({ type: 'Text', text: /Rewrite the whole parser/ })) as any
+    expect(t.text).toContain(long)
+    expect(t.props.wrap).toBe('wrap')
+    await ui.unmount()
+  }
+})
+
+test('the chat view shows the prompt path', async ($, on) => {
+  seed(on, [agent('ses_q', 'asking', { question: 'which db?' })], undefined, undefined, {
+    openAgent: 'ses_q',
+    prompts: { shape: 'prompts-1', value: ['ses_q'] },
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect((await ui.find({ type: 'Text', text: /prompt\.txt/ }))?.text).toBe('.opencode-monitor/ses_q/prompt.txt')
   await ui.unmount()
 })
 
@@ -717,6 +810,7 @@ test('the chat draws a turn line, collapsible reasoning and tool output/diffs', 
 
   expect(await text(/Turn 1/)).toBe('── Turn 1 · 12s · 1.2k tok · $0.004 ──')
   expect(await ui.find({ key: 'thinking-reasoning-r' })).toBeDefined()
+  expect((await ui.find({ key: 'thinking-reasoning-r' }))?.props.label).toBe('Thinking ↓')
   expect(await text(/^Why/)).toBe('Why\nbecause')
   expect(await text(/^alpha$/)).toBe('alpha')
   expect(await text(/^beta$/)).toBe('beta')

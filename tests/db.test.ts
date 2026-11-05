@@ -79,6 +79,8 @@ test('history asks for turn figures, reasoning and bounded tool detail', async (
   expect(sql).toContain("json_extract(p.data, '$.state.output')")
   expect(sql).toContain("json_extract(p.data, '$.state.metadata.diff')")
   expect(sql).toContain("'reasoning'")
+  // A user prompt keeps its whole text, task section included; only replies are cut.
+  expect(sql).toMatch(/case when json_extract\(m\.data, '\$\.role'\) = 'user' then json_extract\(p\.data, '\$\.text'\)\s+else substr/)
 })
 
 test('the session rows carry variant and token totals', async () => {

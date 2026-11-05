@@ -7,7 +7,8 @@ import type { SessionRow } from './db'
 import { DEFAULT_CONFIG, loadConfig } from './config'
 import type { MonitorConfig } from './config'
 import { effortForAgent, formatPlanSet, linkTask, normalizePlan, resolveVariant } from './plan'
-import { renderPane } from './pane'
+import { renderBand, renderPane } from './pane'
+import type { PaneContext } from './pane'
 import {
   composePrompt,
   formatChat,
@@ -134,6 +135,97 @@ async function debugLog($: any, line: string) {
   }
 }
 // TEMP-DEBUG end
+
+// Reads every atom the drawing needs, so a poll's write redraws the pane and the band alike.
+async function paneContext($: any, env: any): Promise<PaneContext> {
+  const known = await read($, statuses)
+  const message = await read($, warning)
+  const stopMessage = await read($, stopError)
+  const opened = await read($, openAgent)
+  const written = await read($, prompts)
+  const log = await read($, history)
+  const view = await read($, chatView)
+  const storedPlan = await read($, plan)
+  const storedView = await read($, planView)
+  const activePlan = isPlan(storedPlan) ? storedPlan : null
+  const activeView: PlanView =
+    typeof storedView === 'object' && storedView !== null && typeof (storedView as PlanView).isCollapsed === 'boolean'
+      ? (storedView as PlanView)
+      : { isCollapsed: false }
+  const agents = (await read($, tracked)).map(
+    a => known.find(s => s.id === a.id) ?? summarize(a.id, NO_ROWS, 0),
+  )
+
+  const stop = async (agent: AgentStatus) => {
+    try {
+      const { content, isError } = await $.mcp.call(SERVER, 'stop', { agent_id: agent.id })
+      if (isError) throw new Error(content.map(c => c.text ?? '').join(' ').trim())
+      const text = `The user stopped opencode agent ${agent.id} (${agent.title}) from the pane.`
+      await update($, stopError, () => '')
+      await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+    } catch (error) {
+      await update($, stopError, () => `Stop failed: ${errorText(error)}`)
+    }
+  }
+
+  // A finished agent is no longer polled, so opening one loads it here.
+  const openChat = async (id: string) => {
+    await update($, chatView, () => ({ isTasksOpen: false, expanded: [] }))
+    await update($, openAgent, () => id)
+    env.setFollowing(true)
+    const error = await env.tracking.loadHistory(id, true)
+    if (error) await update($, warning, () => `Activity unavailable: ${error}`)
+  }
+  const back = async () => {
+    await update($, openAgent, () => '')
+    await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {})
+  }
+  const jump = async () => {
+    env.setFollowing(true)
+    await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {})
+  }
+  const toggleTasks = async () => {
+    const opening = !(await read($, chatView)).isTasksOpen
+    await update($, chatView, v => ({ ...v, isTasksOpen: !v.isTasksOpen }))
+    // The cards sit at the top: stop following the bottom so a redraw does not scroll them away.
+    if (opening) {
+      env.setFollowing(false)
+      await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {})
+    }
+  }
+  const toggle = (id: string) =>
+    update($, chatView, v => ({
+      ...v,
+      expanded: v.expanded.includes(id) ? v.expanded.filter(x => x !== id) : [...v.expanded, id],
+    }))
+  const clearPlan = async () => {
+    await update($, plan, () => null)
+    await update($, planView, () => ({ isCollapsed: false }))
+  }
+  const togglePlan = () => update($, planView, v => ({ ...v, isCollapsed: !v.isCollapsed }))
+
+  return {
+    statuses: agents,
+    warning: message,
+    stopError: stopMessage,
+    openAgent: opened,
+    prompts: written,
+    history: log,
+    chatView: view,
+    plan: activePlan,
+    planView: activeView,
+    isFollowing: env.isFollowing(),
+    effort: env.config.effort,
+    openChat,
+    stop,
+    back,
+    jump,
+    toggleTasks,
+    toggle,
+    clearPlan,
+    togglePlan,
+  }
+}
 
 export const register: Register = on => {
   // $ cannot be stored or passed, so the work that outlives a dispatch closes over
@@ -448,85 +540,18 @@ export const register: Register = on => {
     })
   }
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const known = await read($, statuses)
-    const message = await read($, warning)
-    const stopMessage = await read($, stopError)
-    const opened = await read($, openAgent)
-    const written = await read($, prompts)
-    const log = await read($, history)
-    const view = await read($, chatView)
-    const storedPlan = await read($, plan)
-    const storedView = await read($, planView)
-    const activePlan = isPlan(storedPlan) ? storedPlan : null
-    const activeView: PlanView =
-      typeof storedView === 'object' && storedView !== null && typeof (storedView as PlanView).isCollapsed === 'boolean'
-        ? (storedView as PlanView)
-        : { isCollapsed: false }
-    const agents = (await read($, tracked)).map(
-      a => known.find(s => s.id === a.id) ?? summarize(a.id, NO_ROWS, 0),
-    )
+  const env = {
+    get tracking() { return tracking },
+    get config() { return config },
+    isFollowing: () => isFollowing,
+    setFollowing: (value: boolean) => { isFollowing = value },
+  }
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => renderPane($, e, await paneContext($, env)))
 
-    const stop = async (agent: AgentStatus) => {
-      try {
-        const { content, isError } = await $.mcp.call(SERVER, 'stop', { agent_id: agent.id })
-        if (isError) throw new Error(content.map(c => c.text ?? '').join(' ').trim())
-        const text = `The user stopped opencode agent ${agent.id} (${agent.title}) from the pane.`
-        await update($, stopError, () => '')
-        await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-      } catch (error) {
-        await update($, stopError, () => `Stop failed: ${errorText(error)}`)
-      }
-    }
+  // The chat header lives in the band, above the prompt, so it never scrolls.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || !(await read($, openAgent))) return next(e)
 
-    // A finished agent is no longer polled, so opening one loads it here.
-    const openChat = async (id: string) => {
-      await update($, chatView, () => ({ isTasksOpen: false, expanded: [] }))
-      await update($, openAgent, () => id)
-      isFollowing = true
-      const error = await tracking.loadHistory(id, true)
-      if (error) await update($, warning, () => `Activity unavailable: ${error}`)
-    }
-    const back = async () => {
-      await update($, openAgent, () => '')
-      await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {})
-    }
-    const jump = async () => {
-      isFollowing = true
-      await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {})
-    }
-    const toggleTasks = () => update($, chatView, v => ({ ...v, isTasksOpen: !v.isTasksOpen }))
-    const toggle = (id: string) =>
-      update($, chatView, v => ({
-        ...v,
-        expanded: v.expanded.includes(id) ? v.expanded.filter(x => x !== id) : [...v.expanded, id],
-      }))
-    const clearPlan = async () => {
-      await update($, plan, () => null)
-      await update($, planView, () => ({ isCollapsed: false }))
-    }
-    const togglePlan = () => update($, planView, v => ({ ...v, isCollapsed: !v.isCollapsed }))
-
-    return renderPane($, e, {
-      statuses: agents,
-      warning: message,
-      stopError: stopMessage,
-      openAgent: opened,
-      prompts: written,
-      history: log,
-      chatView: view,
-      plan: activePlan,
-      planView: activeView,
-      isFollowing,
-      effort: config.effort,
-      openChat,
-      stop,
-      back,
-      jump,
-      toggleTasks,
-      toggle,
-      clearPlan,
-      togglePlan,
-    })
+    return renderBand($, e, await paneContext($, env)) ?? next(e)
   })
 }

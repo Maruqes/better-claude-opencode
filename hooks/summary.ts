@@ -213,7 +213,7 @@ export type ChatItem =
   | { kind: 'prompt'; text: string }
   | { kind: 'reply'; text: string }
   | { kind: 'steps'; id: string; label: string; steps: ChatEntry[] }
-  | { kind: 'reasoning'; id: string; text: string; lines: number }
+  | { kind: 'reasoning'; id: string; text: string }
   | { kind: 'turn'; id: string; tokens: number; cost: number; durationMs?: number; index: number }
 
 const stepsLabel = (steps: ChatEntry[]) => {
@@ -267,7 +267,6 @@ export const groupChat = (entries: ChatEntry[]): ChatItem[] => {
         kind: 'reasoning',
         id: entry.id ?? `reasoning-${items.length}`,
         text: entry.text,
-        lines: entry.text.split('\n').length,
       })
     } else if (entry.kind === 'reply') {
       flush()
@@ -307,6 +306,19 @@ export const clipText = (text: string, columns: number, maxRows: number) => {
   }
 
   return { text, isClipped: false }
+}
+
+// The first `maxRows` visual rows of `text`, wrapped at `columns` cells; blank lines stay as empty rows.
+export const wrapRows = (text: string, columns: number, maxRows: number) => {
+  const width = Math.max(1, columns)
+  const rows: string[] = []
+  for (const line of text.split('\n')) {
+    if (!line) rows.push('')
+    for (let at = 0; at < line.length; at += width) rows.push(line.slice(at, at + width))
+    if (rows.length >= maxRows) break
+  }
+
+  return rows.slice(0, maxRows)
 }
 
 export const isActive = (id: string, statuses: AgentStatus[], trackedForMs = 0) => {

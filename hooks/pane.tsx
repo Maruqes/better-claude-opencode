@@ -10,7 +10,7 @@ import type {
   PlanView,
 } from '../types'
 import type { EffortConfig } from './config'
-import { robotSvg } from './mascot'
+import { fadedTextSvg, PROGRESS_TOP, progressSvg, robotSvg } from './mascot'
 import type { RobotState } from './mascot'
 import {
   descriptionOf,
@@ -29,6 +29,7 @@ import {
 import type { PlanRow } from './plan'
 import {
   clipText,
+  wrapRows,
   formatCounts,
   formatElapsed,
   formatShortElapsed,
@@ -70,12 +71,16 @@ const EFFORT_COLORS: Record<Effort, string> = {
   max: 'warning',
 }
 const AVATAR_SIZE = 32
+// Pixels taken from a bar's row by the avatar, gap, padding and border.
+const CARD_INSET = 72
+// The chat header pads one column each side on top of the card's 16px.
+const HEADER_INSET = 32
 const diffColor = (line: string) => {
   if (line.startsWith('+') && !line.startsWith('+++')) return 'success'
   if (line.startsWith('-') && !line.startsWith('---')) return 'error'
   return line.startsWith('@@') ? 'suggestion' : undefined
 }
-const PROMPT_ROWS = 3
+const PROMPT_ROWS = 5
 // No theme key names the background; this one is its colour on light and dark themes alike,
 // and the pinned header must be opaque over the chat rows beneath it.
 const HEADER_BACKGROUND = 'inverseText'
@@ -108,7 +113,8 @@ export type PaneContext = {
 const isSettled = (agent: AgentStatus | undefined) =>
   agent?.state === 'finished' || agent?.state === 'stopped'
 
-export async function renderPane($: any, e: any, ctx: PaneContext) {
+// The elements and small pieces both the pane and the AbovePrompt band draw with.
+function kit($: any, e: any) {
   const ui = $.ui.resolve(e)
   const { Box, Button, Markdown, Text } = ui
   // The terminal's element table has an `Svg` that draws nothing, so test the surface too.
@@ -121,6 +127,23 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
     ) : (
       <Text>{PERSONA_ASCII[persona]}</Text>
     )
+  const progressBar = (key: string, percent: number, inset: number) => {
+    if (!Svg) {
+      return (
+        <Box key={key} flexDirection="row" width="100%" height={1} backgroundColor="subtle">
+          <Box width={`${percent}%`} height={1} backgroundColor="suggestion" />
+        </Box>
+      )
+    }
+    // Columns are about 8 CSS px; 7 stays narrow on purpose, and the box clips any excess.
+    const width = Math.max(80, e.props.bodyColumns * 7 - inset)
+
+    return (
+      <Box key={key} width="100%" minWidth={0} overflow="hidden">
+        <Svg source={progressSvg(width, percent)} alt={`${percent}% done`} width={width} height={6 + PROGRESS_TOP} />
+      </Box>
+    )
+  }
   const metaLine = (effort: Effort, rest: unknown[], wrap = 'truncate-end') => (
     <Box flexDirection="row" columnGap={1}>
       <Text color={EFFORT_COLORS[effort]}>{effort}</Text>
@@ -130,6 +153,61 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
     </Box>
   )
   const effortOf = (agent: AgentStatus) => effortOfVariant(agent.variant) ?? inferEffort(agent.title)
+
+  return { Box, Button, Markdown, Text, Svg, avatar, progressBar, metaLine, effortOf }
+}
+type Kit = ReturnType<typeof kit>
+
+// The chat header: one function for the AbovePrompt band and for the in-flow fallback.
+function chatHeader(k: Kit, ctx: PaneContext, current: AgentStatus) {
+  const { Box, Button, Text, avatar, progressBar, metaLine, effortOf } = k
+  const bar = current.tasks && progressOf(current.tasks)
+  const linked = ctx.plan ? linkTask(ctx.plan, current.title) : undefined
+  const persona = linked?.persona ?? inferPersona(current.title)
+  const heading = linked ? descriptionOf(linked) : current.title
+  const headerEffort = linked?.effort ?? effortOf(current)
+  const headerMeta = [
+    current.model,
+    current.variant,
+    linked && current.variant && effortOfVariant(current.variant) !== linked.effort && `planned ${linked.effort}`,
+    formatElapsed(current.elapsedMs),
+    current.currentTool,
+  ]
+
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Box flexDirection="row" justifyContent="space-between" columnGap={2}>
+        <Button key="back" label="Back" plain dimColor onPress={() => void ctx.back()} />
+        <Box flexDirection="row" gap={2}>
+          {current.tasks && bar && (
+            <Button key="tasks" label={`Tasks ${bar.done}/${bar.total}`} plain dimColor onPress={() => void ctx.toggleTasks()} />
+          )}
+          {current.state === 'running' && <Button key={`stop-${current.id}`} label="Stop" onPress={() => void ctx.stop(current)} />}
+        </Box>
+      </Box>
+      <Box flexDirection="row" alignItems="flex-start" columnGap={1}>
+        {avatar(persona, headerEffort, current.state)}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+          <Text bold wrap="truncate-end">{heading}</Text>
+          {metaLine(headerEffort, headerMeta)}
+        </Box>
+      </Box>
+      {bar && progressBar(`bar-${current.id}`, bar.percent, HEADER_INSET)}
+      {bar && <Text dimColor wrap="truncate-end">{bar.label}</Text>}
+    </Box>
+  )
+}
+
+// The band shows the open agent's header on the terminal; the desktop app does not draw it.
+export function renderBand($: any, e: any, ctx: PaneContext) {
+  const current = ctx.statuses.find(a => a.id === ctx.openAgent)
+
+  return current && e.surface === 'terminal' ? chatHeader(kit($, e), ctx, current) : undefined
+}
+
+export async function renderPane($: any, e: any, ctx: PaneContext) {
+  const k = kit($, e)
+  const { Box, Button, Markdown, Text, Svg, avatar, progressBar, metaLine, effortOf } = k
   // A render must not need the clock: derived from the last poll's elapsed time
   // instead, so every surface (and a test) draws with what it already holds.
   const now = ctx.statuses.reduce((latest, agent) => Math.max(latest, agent.startedAt + agent.elapsedMs), ctx.plan?.createdAt ?? 0)
@@ -143,10 +221,6 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
       {ctx.stopError && <Text color="yellow">! {ctx.stopError}</Text>}
     </Box>
   )
-  const metaOf = (agent: AgentStatus) =>
-    [agent.state === 'asking' && 'asking', agent.model, agent.variant, formatElapsed(agent.elapsedMs), agent.currentTool]
-      .filter(Boolean)
-      .join(' · ')
   const stepLine = (step: ChatEntry) => (
     <Box flexDirection="row" columnGap={1}>
       <Text color={step.kind === 'error' ? 'error' : 'subtle'}>{step.kind === 'error' ? '✗' : '›'}</Text>
@@ -161,23 +235,12 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
   const current = agents.find(a => a.id === opened)
   if (current) {
     const { offset, bodyRows } = e.props.scroll
-    const bar = current.tasks && progressOf(current.tasks)
-    const shownTasks = ctx.chatView.isTasksOpen ? current.tasks ?? [] : []
-    // Every header row is one line, so the pinned box and the space kept for it match.
-    const headerRows = 3 + (bar ? 2 : 0) + shownTasks.length
+    const hasPrompt = ctx.prompts.includes(current.id)
+    const isBandSurface = e.surface === 'terminal'
+    // Nav, gap, title and meta, closing gap, then the bar and its label.
+    const pinnedRows = 5 + (current.tasks && progressOf(current.tasks) ? 2 : 0)
     const chat = ctx.history.id === opened ? ctx.history : undefined
     const items = groupChat(chat?.entries ?? [])
-    const linked = plan ? linkTask(plan, current.title) : undefined
-    const persona = linked?.persona ?? inferPersona(current.title)
-    const heading = linked ? descriptionOf(linked) : current.title
-    const headerEffort = linked?.effort ?? effortOf(current)
-    const headerMeta = [
-      current.model,
-      current.variant,
-      linked && current.variant && effortOfVariant(current.variant) !== linked.effort && `planned ${linked.effort}`,
-      formatElapsed(current.elapsedMs),
-      current.currentTool,
-    ]
     let detailBudget = DETAIL_BUDGET
     let didHideDetail = false
     const takeDetail = (text: string, limit: number) => {
@@ -220,8 +283,17 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
 
     return (
       <Box flexDirection="column">
-        <Box height={headerRows} flexShrink={0} />
-        <Box flexDirection="column" gap={1}>
+        {/* Only the terminal draws the band; elsewhere a pinned header keeps its room here. */}
+        {!isBandSurface && <Box height={pinnedRows} flexShrink={0} />}
+        <Box flexDirection="column" gap={1} paddingTop={1}>
+          {hasPrompt && <Text dimColor wrap="truncate-end">{`.opencode-monitor/${current.id}/prompt.txt`}</Text>}
+          {/* In normal flow, so a long task just makes the page taller and is never cut. */}
+          {ctx.chatView.isTasksOpen &&
+            (current.tasks ?? []).map((task, n) => (
+              <Box key={`task-${n}`} borderStyle="round" borderColor="subtle" paddingX={1}>
+                <Text dimColor={task.status === 'completed'} wrap="wrap">{formatTask(task)}</Text>
+              </Box>
+            ))}
           {chat && chat.total > chat.entries.length && (
             <Text dimColor>Earlier activity hidden · showing the latest {chat.entries.length}</Text>
           )}
@@ -236,7 +308,9 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
                 <Box flexDirection="column" key={item.id}>
                   <Button
                     key={`thinking-${item.id}`}
-                    label={isExpanded ? 'Hide thinking' : `Thinking · ${item.lines} line${item.lines === 1 ? '' : 's'}`}
+                    plain
+                    dimColor
+                    label={isExpanded ? 'Thinking ↓' : 'Thinking →'}
                     onPress={() => void ctx.toggle(item.id)}
                   />
                   {isExpanded && <Text dimColor wrap="wrap">{text}</Text>}
@@ -245,16 +319,34 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
             }
             if (item.kind === 'prompt') {
               const isExpanded = ctx.chatView.expanded.includes(item.text)
-              // The border and padding take four columns from the text.
-              const clipped = clipText(item.text, e.props.bodyColumns - 4, PROMPT_ROWS)
+              const clipped = clipText(item.text, e.props.bodyColumns, PROMPT_ROWS)
+              // No theme key names the background, so a gradient overlay would show as a rectangle on one
+              // theme; the last rows step down to dim and then subtle instead, on every surface.
+              const lines = clipped.text.split('\n')
+              const fade = (n: number) => (n === lines.length - 1 ? { dimColor: true, color: 'subtle' } : n === lines.length - 2 ? { dimColor: true } : {})
 
               return (
-                <Box flexDirection="column" paddingX={1} borderStyle="round" borderColor="subtle">
-                  <Text dimColor>Task</Text>
-                  <Text>{isExpanded ? item.text : clipped.text}</Text>
+                <Box flexDirection="column">
+                  {isExpanded || !clipped.isClipped ? (
+                    <Text>{item.text}</Text>
+                  ) : Svg ? (
+                    // shortcut: ~7px per column and one row per 18px; a wide glyph run is clipped, not rewrapped.
+                    <Box height={PROMPT_ROWS} flexShrink={0} overflow="hidden">
+                    <Svg
+                      source={fadedTextSvg(wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS), Math.max(80, e.props.bodyColumns * 7))}
+                      alt={clipped.text}
+                      width={Math.max(80, e.props.bodyColumns * 7)}
+                      height={Math.min(PROMPT_ROWS, wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS).length) * 18}
+                    />
+                    </Box>
+                  ) : (
+                    lines.map((line, n) => <Text key={n} {...fade(n)}>{line || ' '}</Text>)
+                  )}
                   {clipped.isClipped && (
                     <Button
                       key={`prompt-${i}`}
+                      plain
+                      dimColor
                       label={isExpanded ? 'Show less' : 'Show more'}
                       onPress={() => void ctx.toggle(item.text)}
                     />
@@ -271,16 +363,13 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
 
             return (
               <Box flexDirection="column">
-                <Box flexDirection="row" justifyContent="space-between" columnGap={2}>
-                  <Box flexShrink={1}>
-                    <Text dimColor wrap="truncate-end">{`${isExpanded ? '▾' : '▸'} ${item.label}`}</Text>
-                  </Box>
-                  <Button
-                    key={`steps-${i}`}
-                    label={isExpanded ? 'Hide' : 'Show'}
-                    onPress={() => void ctx.toggle(item.id)}
-                  />
-                </Box>
+                <Button
+                  key={`steps-${i}`}
+                  plain
+                  dimColor
+                  label={`${isExpanded ? '▾' : '▸'} ${item.label}`}
+                  onPress={() => void ctx.toggle(item.id)}
+                />
                 {isExpanded
                   ? item.steps.map(step => (
                       <Box flexDirection="column" key={step.id ?? `${step.text}-${step.detail ?? ''}`}>
@@ -295,53 +384,55 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
           })}
           {warnings}
         </Box>
-        <Box
-          key="chat-header"
-          position="absolute"
-          top={offset}
-          left={0}
-          right={0}
-          height={headerRows}
-          flexDirection="column"
-          backgroundColor={HEADER_BACKGROUND}
-        >
-          <Box flexDirection="row" justifyContent="space-between" columnGap={2}>
-            <Button key="back" label="Back" onPress={() => void ctx.back()} />
-            <Box flexDirection="row" gap={2}>
-              {current.tasks && bar && (
-                <Button
-                  key="tasks"
-                  label={`Tasks ${bar.done}/${bar.total}`}
-                  onPress={() => void ctx.toggleTasks()}
-                />
-              )}
-              {current.state === 'running' && (
-                <Button key={`stop-${current.id}`} label="Stop" onPress={() => void ctx.stop(current)} />
-              )}
-            </Box>
+        {!isBandSurface && (
+          <Box key="chat-header" position="absolute" top={offset} left={0} right={0} height={pinnedRows} backgroundColor={HEADER_BACKGROUND}>
+            {chatHeader(k, ctx, current)}
           </Box>
-          <Box flexDirection="row" columnGap={1}>
-            {avatar(persona, headerEffort, current.state)}
-            <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-              <Text bold wrap="truncate-end">{heading}</Text>
-              {metaLine(headerEffort, headerMeta)}
-            </Box>
-          </Box>
-          {bar && (
-            <Box key={`bar-${current.id}`} flexDirection="row" width="100%" height={1} backgroundColor="subtle">
-              <Box width={`${bar.percent}%`} height={1} backgroundColor="suggestion" />
-            </Box>
-          )}
-          {bar && <Text wrap="truncate-end">{bar.label}</Text>}
-          {shownTasks.map(task => (
-            <Text wrap="truncate-end">{formatTask(task)}</Text>
-          ))}
-        </Box>
+        )}
         {!ctx.isFollowing && (
           <Box key="jump" position="absolute" top={offset + bodyRows - 1} right={0}>
             <Button key="jump-latest" label="Jump to latest" onPress={() => void ctx.jump()} />
           </Box>
         )}
+      </Box>
+    )
+  }
+
+  // List rows stay compact: agent output (question, recent text) lives in the chat view.
+  const agentRow = (agent: AgentStatus, narrow: boolean) => {
+    const effort = effortOf(agent)
+    const bar = agent.tasks && progressOf(agent.tasks)
+
+    return (
+      <Box key={`agent-${agent.id}`} flexDirection="row" alignItems="flex-start" columnGap={1} paddingX={1}>
+        {avatar(inferPersona(agent.title), effort, agent.state)}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
+          <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" columnGap={2}>
+            <Box flexDirection="row" flexGrow={1} flexShrink={1} minWidth={16} columnGap={1}>
+              <Text bold wrap="truncate-end">{agent.title}</Text>
+              <Text color={GLYPH_COLORS[agent.state]}>{GLYPHS[agent.state]}</Text>
+            </Box>
+            <Box flexDirection="row" gap={2}>
+              <Button key={`open-${agent.id}`} label="Open" onPress={() => void ctx.openChat(agent.id)} />
+              {agent.state === 'running' && (
+                <Button key={`stop-${agent.id}`} label="Stop" onPress={() => void ctx.stop(agent)} />
+              )}
+            </Box>
+          </Box>
+          {metaLine(
+            effort,
+            [
+              agent.state === 'asking' && 'asking',
+              agent.model,
+              agent.variant,
+              formatElapsed(agent.elapsedMs),
+              bar && `${bar.done}/${bar.total}`,
+              agent.currentTool,
+            ],
+            narrow ? 'wrap' : 'truncate-end',
+          )}
+          {bar && progressBar(`bar-${agent.id}`, bar.percent, CARD_INSET)}
+        </Box>
       </Box>
     )
   }
@@ -402,19 +493,20 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
             const state = stateOf(agent)
             const elapsed = agent ? formatElapsed(agent.elapsedMs) : 'planned'
             const earlyIds = early(row)
+            const bar = agent?.tasks && progressOf(agent.tasks)
             const meta = [
               agent?.model ?? resolved.model,
               agent?.variant ?? (agent ? undefined : resolved.variant),
+              bar && `${bar.done}/${bar.total}`,
               agent?.currentTool,
               agent?.variant && effortOfVariant(agent.variant) !== row.task.effort && `planned ${row.task.effort}`,
               row.task.after.length > 0 && !earlyIds.length && `after ${row.task.after.join(', ')}`,
             ]
-            const bar = agent?.tasks && progressOf(agent.tasks)
 
             return (
-              <Box key={`task-${row.task.id}`} flexDirection="row" columnGap={1} paddingX={1}>
+              <Box key={`task-${row.task.id}`} flexDirection="row" alignItems="flex-start" columnGap={1} paddingX={1}>
                 {avatar(row.task.persona, row.task.effort, agent?.state ?? 'planned')}
-                <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+                <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
                 <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" columnGap={2}>
                   <Box flexDirection="row" flexGrow={1} flexShrink={1} minWidth={16} columnGap={1}>
                     <Text bold dimColor={!agent} wrap="truncate-end">{descriptionOf(row.task)}</Text>
@@ -435,21 +527,7 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
                 </Box>
                 {metaLine(row.task.effort, meta, narrow ? 'wrap' : 'truncate-end')}
                 {earlyIds.length > 0 && <Text color="warning" wrap={narrow ? 'wrap' : 'truncate-end'}>{`! started before ${earlyIds.join(', ')}`}</Text>}
-                {bar && (
-                  <Box flexDirection="column">
-                    <Box key={`bar-${agent!.id}`} flexDirection="row" width="100%" height={1} backgroundColor="subtle">
-                      <Box width={`${bar.percent}%`} height={1} backgroundColor="suggestion" />
-                    </Box>
-                    <Text wrap="truncate-end">
-                      {bar.done}/{bar.total} {bar.label}
-                    </Text>
-                  </Box>
-                )}
-                {agent?.state === 'running' && agent.recent && <Text dimColor wrap="truncate-end">{agent.recent}</Text>}
-                {agent?.question && <Text>{agent.question}</Text>}
-                {agent && ctx.prompts.includes(agent.id) && (
-                  <Text dimColor wrap="truncate-end">{`.opencode-monitor/${agent.id}/prompt.txt`}</Text>
-                )}
+                {bar && progressBar(`bar-${agent!.id}`, bar.percent, CARD_INSET)}
                 </Box>
               </Box>
             )
@@ -457,40 +535,7 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
         {!ctx.planView.isCollapsed && unplanned.length > 0 && (
           <Box flexDirection="column" gap={1}>
             <Text dimColor>{`Unplanned · ${unplanned.length}`}</Text>
-            {unplanned.map(agent => {
-              const persona = inferPersona(agent.title)
-              const effort = effortOf(agent)
-
-              return (
-                <Box
-                  key={`unplanned-${agent.id}`}
-                  flexDirection="row"
-                  columnGap={1}
-                  paddingX={1}
-                  borderStyle="round"
-                  borderColor="subtle"
-                >
-                  {avatar(persona, effort, agent.state)}
-                  <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-                  <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" columnGap={2}>
-                    <Box flexDirection="row" flexGrow={1} flexShrink={1} minWidth={16} columnGap={1}>
-                      <Text color={GLYPH_COLORS[agent.state]}>{GLYPHS[agent.state]}</Text>
-                      <Text bold wrap="truncate-end">{agent.title}</Text>
-                    </Box>
-                    <Box flexDirection="row" gap={2}>
-                      <Button key={`open-${agent.id}`} label="Open" onPress={() => void ctx.openChat(agent.id)} />
-                      {agent.state === 'running' && (
-                        <Button key={`stop-${agent.id}`} label="Stop" onPress={() => void ctx.stop(agent)} />
-                      )}
-                    </Box>
-                  </Box>
-                  {metaLine(effort, [agent.model, agent.variant, formatElapsed(agent.elapsedMs), agent.currentTool], narrow ? 'wrap' : 'truncate-end')}
-                  {agent.state === 'running' && agent.recent && <Text dimColor wrap="truncate-end">{agent.recent}</Text>}
-                  {agent.question && <Text>{agent.question}</Text>}
-                  </Box>
-                </Box>
-              )
-            })}
+            {unplanned.map(agent => agentRow(agent, narrow))}
           </Box>
         )}
       </Box>
@@ -505,48 +550,7 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
       </Box>
       {planPanel()}
       {!plan && agents.length === 0 && <Text dimColor>No agents yet</Text>}
-      {!plan &&
-        agents.map(agent => {
-          const bar = agent.tasks && progressOf(agent.tasks)
-
-          return (
-            <Box key={`agent-${agent.id}`} flexDirection="row" columnGap={1} paddingX={1} borderStyle="round" borderColor="subtle">
-              {avatar(inferPersona(agent.title), effortOf(agent), agent.state)}
-              <Box flexDirection="column" flexGrow={1} flexShrink={1} gap={1}>
-              <Box flexDirection="column">
-                <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" columnGap={2}>
-                  <Box flexDirection="row" flexGrow={1} flexShrink={1} minWidth={16} columnGap={1}>
-                    <Text color={GLYPH_COLORS[agent.state]}>{GLYPHS[agent.state]}</Text>
-                    <Text bold wrap="truncate-end">{agent.title}</Text>
-                  </Box>
-                  <Box flexDirection="row" gap={2}>
-                    <Button key={`open-${agent.id}`} label="Open" onPress={() => void ctx.openChat(agent.id)} />
-                    {agent.state === 'running' && (
-                      <Button key={`stop-${agent.id}`} label="Stop" onPress={() => void ctx.stop(agent)} />
-                    )}
-                  </Box>
-                </Box>
-                <Text dimColor wrap="truncate-end">{metaOf(agent)}</Text>
-              </Box>
-              {bar && (
-                <Box flexDirection="column">
-                  <Box key={`bar-${agent.id}`} flexDirection="row" width="100%" height={1} backgroundColor="subtle">
-                    <Box width={`${bar.percent}%`} height={1} backgroundColor="suggestion" />
-                  </Box>
-                  <Text wrap="truncate-end">
-                    {bar.done}/{bar.total} {bar.label}
-                  </Text>
-                </Box>
-              )}
-              {agent.state === 'running' && agent.recent && <Text dimColor wrap="truncate-end">{agent.recent}</Text>}
-              {agent.question && <Text>{agent.question}</Text>}
-              {ctx.prompts.includes(agent.id) && (
-                <Text dimColor wrap="truncate-end">{`.opencode-monitor/${agent.id}/prompt.txt`}</Text>
-              )}
-              </Box>
-            </Box>
-          )
-        })}
+      {!plan && agents.map(agent => agentRow(agent, e.props.bodyColumns < 50))}
       {warnings}
     </Box>
   )
