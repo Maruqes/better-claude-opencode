@@ -27,6 +27,7 @@ declare module 'claude-code' {
       tracked: Shaped<TrackedAgent[]>
       statuses: Shaped<OpencodeStatus[]>
       warning: string
+      stopError: string
     }
   }
 }

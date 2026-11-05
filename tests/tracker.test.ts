@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { addAgent, adoptProvisional, confirmAgent, extractAgentId } from '../hooks/tracker'
+import { addAgent, adoptProvisional, confirmAgent, extractAgentId, resultText } from '../hooks/tracker'
 
 const RESULT = (id: string) =>
   `Done.\n\n---\nagent_id: ${id} (continue it with send_message)\nstatus: completed · m · 3 turns · 1.0s · $0.0010 · tokens in 1 / out 2`
@@ -49,4 +49,12 @@ test('a call that ends without an id drops only its own guesses', () => {
   const list = adoptProvisional(adoptProvisional([{ id: 'ses_k' }], ['ses_a'], 'call1'), ['ses_b'], 'call2')
 
   expect(confirmAgent(list, 'call1')).toEqual([{ id: 'ses_k' }, { id: 'ses_b', callId: 'call2' }])
+})
+
+test('result text falls back from text to a string or content blocks', () => {
+  expect(resultText({ result: 'ignored', text: 'core' })).toBe('core')
+  expect(resultText({ result: 'plain' })).toBe('plain')
+  expect(resultText({ result: [{ type: 'text', text: 'a' }, { type: 'image' }, { text: 'b' }] })).toBe('a\n\nb')
+  expect(resultText({ result: { nope: 1 } })).toBeUndefined()
+  expect(resultText({})).toBeUndefined()
 })

@@ -28,11 +28,11 @@ const TOOL = 'mcp__plugin_opencode-subagent-mcp_opencode__'
 const agent = (id: string, state: string, extra = {}) => ({
   id, title: `Task ${id}`, model: 'deepseek-flash', state, startedAt: 0, elapsedMs: 72000, recent: 'running pytest', cost: 0, ...extra,
 })
-const seed = (on: any, statuses: object[], warning?: string) =>
+const seed = (on: any, statuses: object[], warning?: string, stopError?: string) =>
   on('state.get', (_: unknown, e: { key: string }) => {
     if (e.key === 'tracked') return { value: { value: { shape: 'tracked-1', value: statuses.map((s: any) => ({ id: s.id })) }, version: 1 } }
     if (e.key === 'statuses') return { value: { value: { shape: 'statuses-1', value: statuses }, version: 1 } }
-    return { value: { value: warning, version: 1 } }
+    return { value: { value: e.key === 'stopError' ? stopError : warning, version: 1 } }
   })
 
 test('the pane draws each state and the warning', async ($, on) => {
@@ -89,7 +89,24 @@ test('Stop calls the MCP and tells Claude; a failure warns', async ($, hook) => 
   isError = true
   await ui.press({ key: 'stop-ses_r' })
   expect(notes.length).toBe(1)
-  expect(JSON.stringify(writes)).toContain('Stop failed: nope')
+  const failed = writes.find(w => JSON.stringify(w).includes('Stop failed: nope'))
+  expect(failed.key).toBe('stopError')
+
+  isError = false
+  await ui.press({ key: 'stop-ses_r' })
+  expect(writes.at(-1).key).toBe('stopError')
+  expect(writes.at(-1).value).toBe('')
+  await ui.unmount()
+})
+
+test('a Stop failure has its own row beside the activity warning', async ($, on) => {
+  seed(on, [agent('ses_r', 'running')], 'Activity unavailable: boom', 'Stop failed: nope')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect((await ui.findAll({ type: 'Text', text: /^!/ })).map(t => t.text)).toEqual([
+    '! Activity unavailable: boom',
+    '! Stop failed: nope',
+  ])
   await ui.unmount()
 })
 
@@ -104,6 +121,7 @@ const engine = (on: any) => {
     return { value: { isSet: true, version: 1 } }
   })
   on('command.register', () => ({ value: { command: 'opencode-agents' } }))
+  on('tool.register', () => ({ value: {} }))
   on('ui.open', (_: unknown, e: unknown) => (opened.push(e), { value: { isPlaced: true } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('clock.now', () => ({ value: 1000 }))
@@ -143,4 +161,44 @@ test('send_message tracks its id before the call ends, and a failed call still f
   expect(during).toEqual([{ id: 'ses_old' }])
   // The harness reports a throwing test hook as its own error; it still reaches the caller.
   expect(thrown).not.toBe('')
+})
+
+const STATUS = 'mcp__better-claude-opencode__opencode_status'
+const running = (on: any, argv: (a: string[]) => { exitCode: number; stdout: string; stderr: string }) =>
+  on('process.run', (_: unknown, e: { argv: string[] }) => ({ value: argv(e.argv) }))
+
+test('the status tool answers an empty list and an untracked id', async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  expect((await $.tool.call({ tool: STATUS })).result).toBe('No opencode agents tracked.')
+  expect((await $.tool.call({ tool: STATUS, agent_id: 'ses_x' })).result).toBe(
+    'Agent ses_x is not tracked in this session.',
+  )
+})
+
+test('the status tool reports a database failure as text', async ($, on) => {
+  engine(on)
+  running(on, () => ({ exitCode: 1, stdout: '', stderr: 'no database' }))
+  on('tool.call', () => ({ result: {}, text: 'agent_id: ses_a (x)' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
+
+  const { result } = await $.tool.call({ tool: STATUS })
+  expect(result).toBe('Activity unavailable: no database. The MCP wait tool still works.')
+})
+
+test('the status tool queries fresh rows', async ($, on) => {
+  engine(on)
+  const session = { id: 'ses_a', title: 'Task', model: 'm', cost: 0, time_created: 0, time_updated: 0, run_started: 0 }
+  running(on, argv => {
+    const sql = argv.at(-1) ?? ''
+    const stdout = argv[0] === 'opencode' ? '/db' : sql.includes('from session') ? JSON.stringify([session]) : ''
+    return { exitCode: 0, stdout, stderr: '' }
+  })
+  on('tool.call', () => ({ result: {}, text: 'agent_id: ses_a (x)' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: `${TOOL}agent`, prompt: 'x' })
+
+  expect((await $.tool.call({ tool: STATUS, agent_id: 'ses_a' })).result).toBe('ses_a  unknown  0m00s  Task')
 })

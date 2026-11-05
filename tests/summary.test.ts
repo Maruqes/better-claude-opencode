@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { MessageRow, PartRow, Rows } from '../hooks/db'
-import { summarize } from '../hooks/summary'
+import { formatReport, isActive, summarize } from '../hooks/summary'
 
 const ID = 'ses_e547fb5b1ffesqEyfSptqG038W'
 const SESSION = {
@@ -86,4 +86,33 @@ test('a provider error ends the agent and shows the error', () => {
 test('no session or no message is unknown', () => {
   expect(summarize('ses_missing', rows({}), 5100).state).toBe('unknown')
   expect(summarize(ID, { sessions: [SESSION], messages: [], parts: [] }, 5100).state).toBe('unknown')
+})
+
+test('an unknown agent stops counting as active after 60 s; a running one never does', () => {
+  const unknown = summarize(ID, { sessions: [], messages: [], parts: [] }, 0)
+  const running = { ...unknown, state: 'running' as const }
+
+  expect(isActive(ID, [unknown], 60_000)).toBe(true)
+  expect(isActive(ID, [unknown], 60_001)).toBe(false)
+  expect(isActive(ID, [running], 600_000)).toBe(true)
+})
+
+test('the report is compact, and detail adds one line per part', () => {
+  const part = (extra: Partial<PartRow>): PartRow => ({
+    session_id: ID, type: 'tool', tool: null, status: null, title: null, text: null, ...extra,
+  })
+  const rows: Rows = {
+    sessions: [SESSION],
+    messages: [MESSAGE],
+    parts: [
+      part({ tool: 'bash', status: 'running', title: 'pytest' }),
+      part({ type: 'text', text: 'Looking\n  at it' }),
+    ],
+  }
+
+  expect(formatReport([ID], rows, 61_100)).toBe(`${ID}  running  1m00s  bash  Sample task\n  pytest`)
+  expect(formatReport([ID], rows, 61_100, true).split('\n').slice(2)).toEqual([
+    '  - bash [running] pytest',
+    '  - text: Looking at it',
+  ])
 })

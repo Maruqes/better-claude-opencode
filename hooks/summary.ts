@@ -2,6 +2,7 @@ import type { AgentState, AgentStatus } from '../types'
 import type { MessageRow, PartRow, Rows } from './db'
 
 const RECENT_CHARS = 120
+const UNKNOWN_LIMIT_MS = 60_000
 // opencode keeps looping after these, so the agent has not ended.
 const CONTINUES = ['tool-calls', 'unknown']
 
@@ -56,10 +57,11 @@ export const summarize = (id: string, rows: Rows, now: number): AgentStatus => {
   }
 }
 
-export const isActive = (id: string, statuses: AgentStatus[]) => {
+export const isActive = (id: string, statuses: AgentStatus[], trackedForMs = 0) => {
   const state = statuses.find(s => s.id === id)?.state
+  if (state === 'unknown') return trackedForMs <= UNKNOWN_LIMIT_MS
 
-  return !state || state === 'running' || state === 'unknown'
+  return !state || state === 'running'
 }
 
 export const formatElapsed = (ms: number) => {
@@ -67,6 +69,23 @@ export const formatElapsed = (ms: number) => {
 
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
 }
+
+const formatPart = (part: PartRow) =>
+  part.type === 'text'
+    ? `text: ${excerpt(part.text ?? '')}`
+    : [part.tool, part.status && `[${part.status}]`, excerpt(part.title ?? '')].filter(Boolean).join(' ')
+
+// One block per agent; `rows.parts` is already the newest parts of each session.
+export const formatReport = (ids: string[], rows: Rows, now: number, detail = false) =>
+  ids
+    .map(id => {
+      const status = summarize(id, rows, now)
+      const head = [id, status.state, formatElapsed(status.elapsedMs), status.currentTool, status.title]
+      const parts = detail ? rows.parts.filter(p => p.session_id === id).map(p => `  - ${formatPart(p)}`) : []
+
+      return [head.filter(Boolean).join('  '), ...(status.recent ? [`  ${status.recent}`] : []), ...parts].join('\n')
+    })
+    .join('\n')
 
 export const formatCounts = (statuses: AgentStatus[]) =>
   (

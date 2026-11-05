@@ -3,13 +3,14 @@ import type { Register } from 'claude-code'
 
 import type { AgentState, AgentStatus, TrackedAgent } from '../types'
 import { createDb, SESSION_ID } from './db'
-import { formatCounts, formatElapsed, isActive, summarize } from './summary'
-import { addAgent, adoptProvisional, confirmAgent, extractAgentId } from './tracker'
+import { formatCounts, formatElapsed, formatReport, isActive, summarize } from './summary'
+import { addAgent, adoptProvisional, confirmAgent, extractAgentId, resultText } from './tracker'
 
 const PANE = 'opencode-agents'
 const TITLE = 'opencode agents'
 const SERVER = 'plugin:opencode-subagent-mcp:opencode'
 const TOOL_PREFIX = 'mcp__plugin_opencode-subagent-mcp_opencode__'
+const STATUS_TOOL = 'opencode_status'
 const POLL_MS = 2000
 const GLYPHS: Record<AgentState, string> = { running: '●', finished: '✓', stopped: '■', unknown: '?' }
 const NO_ROWS = { sessions: [], messages: [], parts: [] }
@@ -17,6 +18,7 @@ const NO_ROWS = { sessions: [], messages: [], parts: [] }
 const tracked = atom({ plugin: 'better-claude-opencode', key: 'tracked' } as const, [], { shape: 'tracked-1' })
 const statuses = atom({ plugin: 'better-claude-opencode', key: 'statuses' } as const, [], { shape: 'statuses-1' })
 const warning = atom({ plugin: 'better-claude-opencode', key: 'warning' } as const, '')
+const stopError = atom({ plugin: 'better-claude-opencode', key: 'stopError' } as const, '')
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -26,6 +28,7 @@ export const register: Register = on => {
   let tracking: {
     track(change: (list: TrackedAgent[]) => TrackedAgent[]): Promise<void>
     startPolling(): void
+    fetchRows: ReturnType<typeof createDb>['fetchRows']
   }
   const calls = new Map<string, { start: number; adopts: boolean }>()
   // A call ended during a poll, so that poll's view is stale: poll once more.
@@ -35,6 +38,8 @@ export const register: Register = on => {
     const db = createDb({ process: { run: argv => $.process.run(argv) } })
     let timer: { cancel(): void } | undefined
     let isPolling = false
+    // When each agent was first polled, close enough to when it was first tracked.
+    const firstSeen = new Map<string, number>()
 
     const track = async (change: (list: TrackedAgent[]) => TrackedAgent[]) => {
       const wasEmpty = !(await read($, tracked)).length
@@ -59,15 +64,18 @@ export const register: Register = on => {
         }
 
         const ids = (await read($, tracked)).map(a => a.id)
+        const now = await $.clock.now()
+        for (const id of ids) if (!firstSeen.has(id)) firstSeen.set(id, now)
         const rows = await db.fetchRows(ids)
         if (rows.ok) {
-          const now = await $.clock.now()
           await update($, statuses, () => ids.map(id => summarize(id, rows, now)))
         } else error ??= rows.error
         await update($, warning, () => (error ? `Activity unavailable: ${error}` : ''))
 
         const known = await read($, statuses)
-        const isIdle = !(await read($, tracked)).some(a => isActive(a.id, known))
+        const isIdle = !(await read($, tracked)).some(a =>
+          isActive(a.id, known, now - (firstSeen.get(a.id) ?? now)),
+        )
         if (isIdle && !calls.size && !isStale) {
           timer?.cancel()
           timer = undefined
@@ -83,10 +91,19 @@ export const register: Register = on => {
       timer ??= $.clock.every(POLL_MS, () => void poll())
     }
 
-    tracking = { track, startPolling }
+    tracking = { track, startPolling, fetchRows: db.fetchRows }
     await $.command.register({
       name: 'opencode-agents',
       description: "Show this session's opencode subagents in a pane",
+    })
+    await $.tool.register({
+      name: STATUS_TOOL,
+      description:
+        "Report this session's opencode agents from fresh data: state, elapsed time, current tool and a recent excerpt. Omit agent_id for all tracked agents; detail adds the last 10 activity lines.",
+      inputSchema: {
+        type: 'object',
+        properties: { agent_id: { type: 'string' }, detail: { type: 'boolean' } },
+      },
     })
     const known = await read($, statuses)
     if ((await read($, tracked)).some(a => isActive(a.id, known))) startPolling()
@@ -98,6 +115,28 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: TITLE })
 
     return { text: 'opencode agents pane opened.' }
+  })
+
+  on('tool.call', { tool: `mcp__better-claude-opencode__${STATUS_TOOL}` }, async ($, e) => {
+    const { agent_id: id, detail } = e as { agent_id?: string; detail?: boolean }
+    const unavailable = (error: unknown) =>
+      `Activity unavailable: ${errorText(error)}. The MCP wait tool still works.`
+
+    try {
+      const list = (await read($, tracked)).map(a => a.id)
+      const ids = id === undefined ? list : list.filter(known => known === id)
+      if (!ids.length) {
+        return {
+          result: id === undefined ? 'No opencode agents tracked.' : `Agent ${id} is not tracked in this session.`,
+        }
+      }
+      const rows = await tracking.fetchRows(ids)
+      if (!rows.ok) return { result: unavailable(rows.error) }
+
+      return { result: formatReport(ids, rows, await $.clock.now(), detail === true) }
+    } catch (error) {
+      return { result: unavailable(error) }
+    }
   })
 
   for (const name of ['agent', 'send_message', 'wait']) {
@@ -113,7 +152,7 @@ export const register: Register = on => {
       let text: string | undefined
       try {
         const ran = await next(e)
-        text = ran.text
+        text = resultText(ran)
 
         return ran
       } finally {
@@ -129,6 +168,7 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const known = await read($, statuses)
     const message = await read($, warning)
+    const stopMessage = await read($, stopError)
     const agents = (await read($, tracked)).map(
       a => known.find(s => s.id === a.id) ?? summarize(a.id, NO_ROWS, 0),
     )
@@ -138,9 +178,10 @@ export const register: Register = on => {
         const { content, isError } = await $.mcp.call(SERVER, 'stop', { agent_id: agent.id })
         if (isError) throw new Error(content.map(c => c.text ?? '').join(' ').trim())
         const text = `The user stopped opencode agent ${agent.id} (${agent.title}) from the pane.`
+        await update($, stopError, () => '')
         await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
       } catch (error) {
-        await update($, warning, () => `Stop failed: ${errorText(error)}`)
+        await update($, stopError, () => `Stop failed: ${errorText(error)}`)
       }
     }
 
@@ -173,6 +214,7 @@ export const register: Register = on => {
           </Box>
         ))}
         {message && <Text color="yellow">! {message}</Text>}
+        {stopMessage && <Text color="yellow">! {stopMessage}</Text>}
       </Box>
     )
   })

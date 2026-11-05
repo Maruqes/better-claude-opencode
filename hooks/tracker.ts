@@ -8,6 +8,15 @@ const BACKGROUND_ID = /^(?:(?:Started|Resumed) agent|Agent) (ses_[A-Za-z0-9]+)\b
 export const extractAgentId = (text: string): string | undefined =>
   [...text.matchAll(RESULT_ID)].at(-1)?.[1] ?? text.match(BACKGROUND_ID)?.[1]
 
+// Core sets `text` on what it ran, but another hook's own answer carries only `result`.
+export const resultText = (ran: { result?: unknown; text?: string }): string | undefined => {
+  if (ran.text !== undefined) return ran.text
+  if (typeof ran.result === 'string') return ran.result
+  if (!Array.isArray(ran.result)) return undefined
+
+  return ran.result.map((block: { text?: unknown }) => (typeof block?.text === 'string' ? block.text : '')).join('\n')
+}
+
 export const addAgent = (list: TrackedAgent[], id: string): TrackedAgent[] =>
   list.some(a => a.id === id)
     ? list.map(a => (a.id === id ? { id } : a))
