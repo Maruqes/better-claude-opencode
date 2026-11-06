@@ -33,12 +33,13 @@ import {
 
 const PANE = 'opencode-agents'
 const TITLE = 'opencode agents'
-const SERVER = 'plugin:opencode-subagent-mcp:opencode'
 const TOOL_PREFIX = 'mcp__plugin_opencode-subagent-mcp_opencode__'
 const PLUGIN_TOOL_PREFIX = 'mcp__opencode-agent-monitor__'
 const STATUS_TOOL = 'opencode_status'
 const PLAN_TOOL = 'opencode_plan'
 const POLL_MS = 2000
+// Agents whose pane Stop is in flight: the only stop calls the tool.check hook allows.
+const pressedStops = new Set<string>()
 const PROMPT_DIR = '.opencode-monitor'
 const NO_ROWS = { sessions: [], messages: [], parts: [], todos: [] }
 const DELEGATION_SECTION = {
@@ -158,8 +159,20 @@ async function paneContext($: any, env: any): Promise<PaneContext> {
 
   const stop = async (agent: AgentStatus) => {
     try {
-      const { content, isError } = await $.mcp.call(SERVER, 'stop', { agent_id: agent.id })
-      if (isError) throw new Error(content.map(c => c.text ?? '').join(' ').trim())
+      // Outside auto mode this runs directly; consent names the press for a local classifier.
+      const consent = `The user pressed Stop on opencode agent ${agent.id} in the agents pane.`
+      pressedStops.add(agent.id)
+      const result = await $.tool.call({ tool: `${TOOL_PREFIX}stop`, agent_id: agent.id, consent }).finally(() => pressedStops.delete(agent.id))
+      if (result.deny !== undefined) {
+        // The server classifier reviews only calls Claude makes, so a pane call gets no verdict: Claude must make it.
+        await update($, stopError, () => `Stop waiting: Claude stops ${agent.id} when its current turn ends.`)
+        // Resolves when the turn starts, so a Claude blocked on this agent's own call holds it until the agent ends.
+        const asked = await $.prompt.submit({ text: `I pressed Stop on opencode agent ${agent.id} in the agents pane. Stop that agent now with the stop tool.` })
+        if (asked.drop !== undefined) throw new Error(asked.drop)
+        await update($, stopError, () => '')
+        return
+      }
+      if (result.isError) throw new Error(result.text ?? 'stop failed')
       const text = `The user stopped opencode agent ${agent.id} (${agent.title}) from the pane.`
       await update($, stopError, () => '')
       await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
@@ -182,17 +195,10 @@ async function paneContext($: any, env: any): Promise<PaneContext> {
   }
   const jump = async () => {
     env.setFollowing(true)
+    $.ui.invalidate('ui.render')
     await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {})
   }
-  const toggleTasks = async () => {
-    const opening = !(await read($, chatView)).isTasksOpen
-    await update($, chatView, v => ({ ...v, isTasksOpen: !v.isTasksOpen }))
-    // The cards sit at the top: stop following the bottom so a redraw does not scroll them away.
-    if (opening) {
-      env.setFollowing(false)
-      await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {})
-    }
-  }
+  const toggleTasks = () => update($, chatView, v => ({ ...v, isTasksOpen: !v.isTasksOpen }))
   const toggle = (id: string) =>
     update($, chatView, v => ({
       ...v,
@@ -418,8 +424,12 @@ export const register: Register = on => {
   })
 
   // Only a move that ends short of the bottom unsets it; our own `end` scroll leaves it be.
-  on('ui.scroll', { requestId: PANE }, async (_$, e, next) => {
-    if (e.origin.kind === 'person') isFollowing = endsAtBottom(e)
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person' && isFollowing !== endsAtBottom(e)) {
+      isFollowing = !isFollowing
+      // A pane move redraws the pane alone; Jump to latest may live in the band.
+      $.ui.invalidate('ui.render')
+    }
 
     return next(e)
   })
@@ -452,6 +462,15 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: TITLE })
 
     return { text: 'opencode agents pane opened.' }
+  })
+
+  // The server classifier never sees a pane call, so the person's press is the approval, for that one agent.
+  on('tool.check', { tool: `${TOOL_PREFIX}stop` }, ($, e, next) => {
+    const id = (e.input as { agent_id?: unknown }).agent_id
+    if (next.origin.plugin === 'opencode-agent-monitor' && typeof id === 'string' && pressedStops.delete(id)) {
+      return { decision: 'allow', reason: `The user pressed Stop on opencode agent ${id} in the agents pane.` }
+    }
+    return next(e)
   })
 
   on('tool.call', { tool: `mcp__opencode-agent-monitor__${STATUS_TOOL}` }, async ($, e) => {

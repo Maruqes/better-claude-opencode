@@ -26,14 +26,21 @@ import {
   resolvedTask,
   unplannedAgents,
 } from './plan'
-import type { PlanRow } from './plan'
+import type { PlanRow, PlanStats } from './plan'
 import {
+  clipDiff,
+  closingLine,
+  promptTask,
+  questionParts,
+  thinkingLabel,
   clipText,
+  codeText,
   wrapRows,
   formatCounts,
   formatElapsed,
   formatShortElapsed,
-  formatTask,
+  STATE_LABELS,
+  taskGlyph,
   formatTurnCost,
   groupChat,
   progressOf,
@@ -75,15 +82,7 @@ const AVATAR_SIZE = 32
 const CARD_INSET = 72
 // The chat header pads one column each side on top of the card's 16px.
 const HEADER_INSET = 32
-const diffColor = (line: string) => {
-  if (line.startsWith('+') && !line.startsWith('+++')) return 'success'
-  if (line.startsWith('-') && !line.startsWith('---')) return 'error'
-  return line.startsWith('@@') ? 'suggestion' : undefined
-}
 const PROMPT_ROWS = 5
-// No theme key names the background; this one is its colour on light and dark themes alike,
-// and the pinned header must be opaque over the chat rows beneath it.
-const HEADER_BACKGROUND = 'inverseText'
 const DETAIL_BUDGET = 15_000
 const OUTPUT_LINES = 6
 const DIFF_LINES = 20
@@ -104,7 +103,7 @@ export type PaneContext = {
   stop(agent: AgentStatus): Promise<void>
   back(): Promise<void>
   jump(): Promise<void>
-  toggleTasks(): Promise<void>
+  toggleTasks(): Promise<unknown>
   toggle(key: string): Promise<unknown>
   clearPlan(): Promise<unknown>
   togglePlan(): Promise<unknown>
@@ -159,19 +158,20 @@ function kit($: any, e: any) {
 type Kit = ReturnType<typeof kit>
 
 // The chat header: one function for the AbovePrompt band and for the in-flow fallback.
-function chatHeader(k: Kit, ctx: PaneContext, current: AgentStatus) {
-  const { Box, Button, Text, avatar, progressBar, metaLine, effortOf } = k
+function chatHeader(k: Kit, ctx: PaneContext, current: AgentStatus, canJump = false) {
+  const { Box, Button, Text, avatar, progressBar, effortOf } = k
   const bar = current.tasks && progressOf(current.tasks)
   const linked = ctx.plan ? linkTask(ctx.plan, current.title) : undefined
   const persona = linked?.persona ?? inferPersona(current.title)
   const heading = linked ? descriptionOf(linked) : current.title
   const headerEffort = linked?.effort ?? effortOf(current)
+  // Most live first, so truncation drops the least useful.
   const headerMeta = [
+    formatElapsed(current.elapsedMs),
+    current.currentTool,
     current.model,
     current.variant,
     linked && current.variant && effortOfVariant(current.variant) !== linked.effort && `planned ${linked.effort}`,
-    formatElapsed(current.elapsedMs),
-    current.currentTool,
   ]
 
   return (
@@ -179,6 +179,7 @@ function chatHeader(k: Kit, ctx: PaneContext, current: AgentStatus) {
       <Box flexDirection="row" justifyContent="space-between" columnGap={2}>
         <Button key="back" label="Back" plain dimColor onPress={() => void ctx.back()} />
         <Box flexDirection="row" gap={2}>
+          {canJump && !ctx.isFollowing && <Button key="jump-latest" label="Jump to latest" plain dimColor onPress={() => void ctx.jump()} />}
           {current.tasks && bar && (
             <Button key="tasks" label={`Tasks ${bar.done}/${bar.total}`} plain dimColor onPress={() => void ctx.toggleTasks()} />
           )}
@@ -189,20 +190,39 @@ function chatHeader(k: Kit, ctx: PaneContext, current: AgentStatus) {
         {avatar(persona, headerEffort, current.state)}
         <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0}>
           <Text bold wrap="truncate-end">{heading}</Text>
-          {metaLine(headerEffort, headerMeta)}
+          <Box flexDirection="row" columnGap={1}>
+            <Text color={GLYPH_COLORS[current.state]}>{`${GLYPHS[current.state]} ${STATE_LABELS[current.state]}`}</Text>
+            <Text color={EFFORT_COLORS[headerEffort]}>{headerEffort}</Text>
+            <Box flexShrink={1}>
+              <Text dimColor wrap="truncate-end">{headerMeta.filter(Boolean).join(' · ')}</Text>
+            </Box>
+          </Box>
         </Box>
       </Box>
       {bar && progressBar(`bar-${current.id}`, bar.percent, HEADER_INSET)}
       {bar && <Text dimColor wrap="truncate-end">{bar.label}</Text>}
+      {/* Under its button, so it shows wherever the chat is scrolled; a band too tall for its room scrolls. */}
+      {ctx.chatView.isTasksOpen &&
+        (current.tasks ?? []).map((task, n) => (
+          <Box key={`task-${n}`} flexDirection="row" columnGap={1} marginTop={n === 0 ? 1 : 0}>
+            <Text color={task.status === 'in_progress' ? 'suggestion' : task.status === 'completed' ? 'success' : 'subtle'}>{taskGlyph(task)}</Text>
+            <Box flexShrink={1}>
+              <Text bold={task.status === 'in_progress'} dimColor={task.status === 'completed'} wrap="wrap">{task.content}</Text>
+            </Box>
+          </Box>
+        ))}
     </Box>
   )
 }
 
-// The band shows the open agent's header on the terminal; the desktop app does not draw it.
+// The band is outside every scroller, the one place a header can stay still. Nothing inside a desktop pane
+// can: its body is a native scroller that moves before hooks hear of it, and sticky positions are refused.
+const hasBand = (surface: string) => surface === 'terminal' || surface === 'desktop'
+
 export function renderBand($: any, e: any, ctx: PaneContext) {
   const current = ctx.statuses.find(a => a.id === ctx.openAgent)
 
-  return current && e.surface === 'terminal' ? chatHeader(kit($, e), ctx, current) : undefined
+  return current && hasBand(e.surface) ? chatHeader(kit($, e), ctx, current, e.surface === 'desktop') : undefined
 }
 
 export async function renderPane($: any, e: any, ctx: PaneContext) {
@@ -225,8 +245,9 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
     <Box flexDirection="row" columnGap={1}>
       <Text color={step.kind === 'error' ? 'error' : 'subtle'}>{step.kind === 'error' ? '✗' : '›'}</Text>
       <Box flexShrink={1}>
-        <Text color={step.kind === 'error' ? 'error' : undefined} dimColor={step.kind !== 'error'} wrap="truncate-end">
-          {[step.text, step.detail].filter(Boolean).join('  ')}
+        <Text color={step.kind === 'error' ? 'error' : undefined} wrap="truncate-end">
+          {step.text}
+          {step.detail && <Text dimColor={step.kind !== 'error'}>{`  ${step.detail}`}</Text>}
         </Text>
       </Box>
     </Box>
@@ -234,11 +255,9 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
 
   const current = agents.find(a => a.id === opened)
   if (current) {
+    const { Code } = $.ui.resolve(e)
     const { offset, bodyRows } = e.props.scroll
     const hasPrompt = ctx.prompts.includes(current.id)
-    const isBandSurface = e.surface === 'terminal'
-    // Nav, gap, title and meta, closing gap, then the bar and its label.
-    const pinnedRows = 5 + (current.tasks && progressOf(current.tasks) ? 2 : 0)
     const chat = ctx.history.id === opened ? ctx.history : undefined
     const items = groupChat(chat?.entries ?? [])
     let detailBudget = DETAIL_BUDGET
@@ -251,22 +270,19 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
       return slice
     }
     const detail = (step: ChatEntry) => {
-      const output = step.output ? takeDetail(step.output, OUTPUT_CHARS) : ''
-      const diff = step.diff ? takeDetail(step.diff, DIFF_CHARS) : ''
+      const output = step.output ? codeText(takeDetail(step.output, OUTPUT_CHARS)) : ''
+      const diff = step.diff ? codeText(takeDetail(step.diff, DIFF_CHARS)) : ''
       const outLines = output ? output.split('\n') : []
-      const diffLines = diff ? diff.split('\n') : []
+      const diffLines = diff.split('\n').slice(Math.max(0, diff.split('\n').findIndex(l => l.startsWith('@@'))))
+      const diffTotal = diffLines.filter(l => !l.startsWith('@@')).length
       if ((step.output && !output) || (step.diff && !diff)) didHideDetail = true
 
       return (
         <Box flexDirection="column" paddingLeft={2}>
-          {outLines.slice(0, OUTPUT_LINES).map((line, index) => (
-            <Text key={`out-${index}`} dimColor wrap="truncate-end">{line || ' '}</Text>
-          ))}
+          {outLines.length > 0 && <Code source={outLines.slice(0, OUTPUT_LINES).join('\n')} wrap="truncate-end" />}
           {outLines.length > OUTPUT_LINES && <Text dimColor>… {outLines.length - OUTPUT_LINES} more lines</Text>}
-          {diffLines.slice(0, DIFF_LINES).map((line, index) => (
-            <Text key={`diff-${index}`} color={diffColor(line)} dimColor={!diffColor(line)} wrap="truncate-end">{line || ' '}</Text>
-          ))}
-          {diffLines.length > DIFF_LINES && <Text dimColor>… {diffLines.length - DIFF_LINES} more diff lines</Text>}
+          {diff && <Code format="diff" source={clipDiff(diff, DIFF_LINES)} wrap="truncate-end" />}
+          {diffTotal > DIFF_LINES && <Text dimColor>… {diffTotal - DIFF_LINES} more diff lines</Text>}
         </Box>
       )
     }
@@ -278,118 +294,148 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
         formatTurnCost(item.cost) || undefined,
       ].filter(Boolean)
 
-      return <Text key={item.id} dimColor wrap="truncate-end">{`── ${metrics.join(' · ')} ──`}</Text>
+      return <Text key={item.id} dimColor wrap="truncate-end">{metrics.join(' · ')}</Text>
+    }
+
+    const lastReply = items.findLastIndex(item => item.kind === 'reply')
+    const firstPrompt = items.findIndex(item => item.kind === 'prompt')
+    const caption = <Text dimColor wrap="truncate-end">{`.opencode-monitor/${current.id}/prompt.txt`}</Text>
+    const closing = closingLine(current)
+    const asked = questionParts(current.question ?? '')
+    const renderItem = (item: ChatItem, i: number) => {
+      if (item.kind === 'turn') return turnLine(item)
+      if (item.kind === 'reply') {
+        // The question is drawn below, once, with its options.
+        const marker = current.state === 'asking' && i === lastReply ? [...item.text.matchAll(/^QUESTION:/gm)].at(-1)?.index : undefined
+        const text = marker === undefined ? item.text : item.text.slice(0, marker).trim()
+
+        return text ? <Markdown text={text} /> : undefined
+      }
+      if (item.kind === 'reasoning') {
+        const isExpanded = ctx.chatView.expanded.includes(item.id)
+        const text = isExpanded ? takeDetail(item.text, 4000) : ''
+
+        return (
+          <Box flexDirection="column" key={item.id}>
+            <Button
+              key={`thinking-${item.id}`}
+              plain
+              dimColor
+              label={thinkingLabel(item.text, isExpanded)}
+              onPress={() => void ctx.toggle(item.id)}
+            />
+            {isExpanded && (
+              <Box paddingLeft={2}>
+                <Text dimColor italic wrap="wrap">{text}</Text>
+              </Box>
+            )}
+          </Box>
+        )
+      }
+      if (item.kind === 'prompt') {
+        const isExpanded = ctx.chatView.expanded.includes(item.text)
+        const task = promptTask(item.text)
+        const clipped = clipText(task, e.props.bodyColumns, PROMPT_ROWS)
+        // No theme key names the background, so a gradient overlay would show as a rectangle on one
+        // theme; the last rows step down to dim and then subtle instead, on every surface.
+        const lines = clipped.text.split('\n')
+        const fade = (n: number) => (n === lines.length - 1 ? { dimColor: true, color: 'subtle' } : n === lines.length - 2 ? { dimColor: true } : {})
+
+        return (
+          <Box flexDirection="column">
+            {isExpanded || !clipped.isClipped ? (
+              <Text>{task}</Text>
+            ) : Svg ? (
+              // shortcut: ~7px per column and one row per 18px; a wide glyph run is clipped, not rewrapped.
+              <Box height={PROMPT_ROWS} flexShrink={0} overflow="hidden">
+              <Svg
+                source={fadedTextSvg(wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS), Math.max(80, e.props.bodyColumns * 7))}
+                alt={clipped.text}
+                width={Math.max(80, e.props.bodyColumns * 7)}
+                height={Math.min(PROMPT_ROWS, wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS).length) * 18}
+              />
+              </Box>
+            ) : (
+              lines.map((line, n) => <Text key={n} {...fade(n)}>{line || ' '}</Text>)
+            )}
+            {clipped.isClipped && (
+              <Button
+                key={`prompt-${i}`}
+                plain
+                dimColor
+                label={isExpanded ? 'Show less' : 'Show more'}
+                onPress={() => void ctx.toggle(item.text)}
+              />
+            )}
+            {hasPrompt && i === firstPrompt && caption}
+          </Box>
+        )
+      }
+      const [only] = item.steps
+      const hasDetail = item.steps.some(step => step.output || step.diff)
+      const isExpanded = ctx.chatView.expanded.includes(item.id)
+      if (item.steps.length === 1 && only && !hasDetail) return stepLine(only)
+      const latest = item.steps.at(-1)
+      const isLive = current.state === 'running' && i === items.length - 1
+
+      return (
+        <Box flexDirection="column">
+          <Button
+            key={`steps-${i}`}
+            plain
+            dimColor
+            label={`${isExpanded ? '▾' : '▸'} ${item.label}`}
+            onPress={() => void ctx.toggle(item.id)}
+          />
+          {isExpanded
+            ? item.steps.map(step => (
+                <Box flexDirection="column" key={step.id ?? `${step.text}-${step.detail ?? ''}`}>
+                  {stepLine(step)}
+                  {(step.output || step.diff) && detail(step)}
+                </Box>
+              ))
+            : isLive && latest && stepLine(latest)}
+          {isExpanded && didHideDetail && <Text dimColor>… more detail hidden</Text>}
+        </Box>
+      )
     }
 
     return (
       <Box flexDirection="column">
-        {/* Only the terminal draws the band; elsewhere a pinned header keeps its room here. */}
-        {!isBandSurface && <Box height={pinnedRows} flexShrink={0} />}
-        <Box flexDirection="column" gap={1} paddingTop={1}>
-          {hasPrompt && <Text dimColor wrap="truncate-end">{`.opencode-monitor/${current.id}/prompt.txt`}</Text>}
-          {/* In normal flow, so a long task just makes the page taller and is never cut. */}
-          {ctx.chatView.isTasksOpen &&
-            (current.tasks ?? []).map((task, n) => (
-              <Box key={`task-${n}`} borderStyle="round" borderColor="subtle" paddingX={1}>
-                <Text dimColor={task.status === 'completed'} wrap="wrap">{formatTask(task)}</Text>
-              </Box>
-            ))}
+        {/* No band on these surfaces, so the header scrolls with the chat. */}
+        {!hasBand(e.surface) && chatHeader(k, ctx, current)}
+        {/* The way out, should the desktop app not show the band. */}
+        {e.surface === 'desktop' && <Button key="back" label="Back" plain dimColor onPress={() => void ctx.back()} />}
+        <Box flexDirection="column" paddingTop={1}>
+          {hasPrompt && firstPrompt < 0 && caption}
           {chat && chat.total > chat.entries.length && (
             <Text dimColor>Earlier activity hidden · showing the latest {chat.entries.length}</Text>
           )}
-          {items.map((item, i) => {
-            if (item.kind === 'turn') return turnLine(item)
-            if (item.kind === 'reply') return <Markdown text={item.text} />
-            if (item.kind === 'reasoning') {
-              const isExpanded = ctx.chatView.expanded.includes(item.id)
-              const text = isExpanded ? takeDetail(item.text, 4000) : ''
-
-              return (
-                <Box flexDirection="column" key={item.id}>
-                  <Button
-                    key={`thinking-${item.id}`}
-                    plain
-                    dimColor
-                    label={isExpanded ? 'Thinking ↓' : 'Thinking →'}
-                    onPress={() => void ctx.toggle(item.id)}
-                  />
-                  {isExpanded && <Text dimColor wrap="wrap">{text}</Text>}
-                </Box>
-              )
-            }
-            if (item.kind === 'prompt') {
-              const isExpanded = ctx.chatView.expanded.includes(item.text)
-              const clipped = clipText(item.text, e.props.bodyColumns, PROMPT_ROWS)
-              // No theme key names the background, so a gradient overlay would show as a rectangle on one
-              // theme; the last rows step down to dim and then subtle instead, on every surface.
-              const lines = clipped.text.split('\n')
-              const fade = (n: number) => (n === lines.length - 1 ? { dimColor: true, color: 'subtle' } : n === lines.length - 2 ? { dimColor: true } : {})
-
-              return (
-                <Box flexDirection="column">
-                  {isExpanded || !clipped.isClipped ? (
-                    <Text>{item.text}</Text>
-                  ) : Svg ? (
-                    // shortcut: ~7px per column and one row per 18px; a wide glyph run is clipped, not rewrapped.
-                    <Box height={PROMPT_ROWS} flexShrink={0} overflow="hidden">
-                    <Svg
-                      source={fadedTextSvg(wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS), Math.max(80, e.props.bodyColumns * 7))}
-                      alt={clipped.text}
-                      width={Math.max(80, e.props.bodyColumns * 7)}
-                      height={Math.min(PROMPT_ROWS, wrapRows(clipped.text, e.props.bodyColumns, PROMPT_ROWS).length) * 18}
-                    />
-                    </Box>
-                  ) : (
-                    lines.map((line, n) => <Text key={n} {...fade(n)}>{line || ' '}</Text>)
-                  )}
-                  {clipped.isClipped && (
-                    <Button
-                      key={`prompt-${i}`}
-                      plain
-                      dimColor
-                      label={isExpanded ? 'Show less' : 'Show more'}
-                      onPress={() => void ctx.toggle(item.text)}
-                    />
-                  )}
-                </Box>
-              )
-            }
-            const [only] = item.steps
-            const hasDetail = item.steps.some(step => step.output || step.diff)
-            const isExpanded = ctx.chatView.expanded.includes(item.id)
-            if (item.steps.length === 1 && only && !hasDetail) return stepLine(only)
-            const latest = item.steps.at(-1)
-            const isLive = current.state === 'running' && i === items.length - 1
-
-            return (
-              <Box flexDirection="column">
-                <Button
-                  key={`steps-${i}`}
-                  plain
-                  dimColor
-                  label={`${isExpanded ? '▾' : '▸'} ${item.label}`}
-                  onPress={() => void ctx.toggle(item.id)}
-                />
-                {isExpanded
-                  ? item.steps.map(step => (
-                      <Box flexDirection="column" key={step.id ?? `${step.text}-${step.detail ?? ''}`}>
-                        {stepLine(step)}
-                        {(step.output || step.diff) && detail(step)}
-                      </Box>
-                    ))
-                  : isLive && latest && stepLine(latest)}
-                {isExpanded && didHideDetail && <Text dimColor>… more detail hidden</Text>}
-              </Box>
-            )
-          })}
+          {items.length === 0 && <Text dimColor>Waiting for the agent's first activity</Text>}
+          {items.map((item, i) => (
+            // More room above a turn than between its parts, and none under it.
+            <Box key={`item-${i}`} flexDirection="column" paddingTop={i === 0 || items[i - 1]?.kind === 'turn' ? 0 : item.kind === 'turn' ? 2 : 1}>
+              {renderItem(item, i)}
+            </Box>
+          ))}
+          {closing && (
+            <Box key="closing" flexDirection="row" columnGap={1} paddingTop={1}>
+              <Text color={GLYPH_COLORS[current.state]}>{GLYPHS[current.state]}</Text>
+              <Text dimColor wrap="truncate-end">{closing}</Text>
+            </Box>
+          )}
+          {current.state === 'asking' && current.question && (
+            <Box key="question" flexDirection="column" paddingTop={1}>
+              <Text bold color="warning">{STATE_LABELS.asking}</Text>
+              <Markdown text={asked.text} />
+              {asked.options.map((option, n) => (
+                <Text key={`option-${n}`}>{option}{n === 0 && <Text dimColor>{' · recommended'}</Text>}</Text>
+              ))}
+            </Box>
+          )}
           {warnings}
         </Box>
-        {!isBandSurface && (
-          <Box key="chat-header" position="absolute" top={offset} left={0} right={0} height={pinnedRows} backgroundColor={HEADER_BACKGROUND}>
-            {chatHeader(k, ctx, current)}
-          </Box>
-        )}
-        {!ctx.isFollowing && (
+        {!ctx.isFollowing && e.surface !== 'desktop' && (
           <Box key="jump" position="absolute" top={offset + bodyRows - 1} right={0}>
             <Button key="jump-latest" label="Jump to latest" onPress={() => void ctx.jump()} />
           </Box>
@@ -437,26 +483,26 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
     )
   }
 
+  const card = (key: string, label: string, value: string) => (
+    <Box key={key} flexDirection="column" flexGrow={1} minWidth={10} paddingX={1} borderStyle="round" borderColor="subtle">
+      <Text dimColor>{label}</Text>
+      <Text>{value}</Text>
+    </Box>
+  )
+  const statCards = (stats: PlanStats, narrow: boolean) => (
+    <Box flexDirection={narrow ? 'column' : 'row'} gap={1}>
+      {card('stat-cost', 'Cost', formatCost(stats.cost))}
+      {card('stat-tokens', 'Tokens', formatTokens(stats.tokens))}
+      {card('stat-time', 'Time', formatClock(stats.elapsedMs))}
+    </Box>
+  )
+
   const planPanel = () => {
     if (!plan) return undefined
     const stats = planStats(plan, statuses, now)
     const rows = planRows(plan, statuses)
     const unplanned = unplannedAgents(plan, statuses)
     const narrow = e.props.bodyColumns < 50
-    const card = (key: string, label: string, value: string) => (
-      <Box
-        key={key}
-        flexDirection="column"
-        flexGrow={1}
-        minWidth={10}
-        paddingX={1}
-        borderStyle="round"
-        borderColor="subtle"
-      >
-        <Text dimColor>{label}</Text>
-        <Text>{value}</Text>
-      </Box>
-    )
     const stateOf = (agent: AgentStatus | undefined) => (agent ? GLYPHS[agent.state] : '○')
     const early = (row: PlanRow) =>
       row.newest?.state === 'running'
@@ -476,13 +522,7 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
             <Button key="plan-clear" label="Clear" onPress={() => void ctx.clearPlan()} />
           </Box>
         </Box>
-        {!ctx.planView.isCollapsed && (
-          <Box flexDirection={narrow ? 'column' : 'row'} gap={1}>
-            {card('stat-cost', 'Cost', formatCost(stats.cost))}
-            {card('stat-tokens', 'Tokens', formatTokens(stats.tokens))}
-            {card('stat-time', 'Time', formatClock(stats.elapsedMs))}
-          </Box>
-        )}
+        {!ctx.planView.isCollapsed && statCards(stats, narrow)}
         {!ctx.planView.isCollapsed && (
           <Text dimColor>{`Planned · ${stats.total} · ${stats.done} done`}</Text>
         )}
@@ -550,6 +590,7 @@ export async function renderPane($: any, e: any, ctx: PaneContext) {
       </Box>
       {planPanel()}
       {!plan && agents.length === 0 && <Text dimColor>No agents yet</Text>}
+      {!plan && agents.length > 0 && statCards(planStats({ title: '', createdAt: Math.min(...agents.map(a => a.startedAt)), tasks: [] }, agents, now), e.props.bodyColumns < 50)}
       {!plan && agents.map(agent => agentRow(agent, e.props.bodyColumns < 50))}
       {warnings}
     </Box>

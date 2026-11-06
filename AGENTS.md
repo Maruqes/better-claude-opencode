@@ -17,6 +17,17 @@ Every project update must also update SilverBullet. In the same task, change the
 - Types: `tsc -p .`
 - Install or update: `./install.sh`
 
+## Seeing the pane
+
+`preview/serve.ts` renders the real `hooks/pane.tsx` as HTML with sample data, so you can look at a UI change instead of guessing.
+
+1. Run `bun --tsconfig-override preview/tsconfig.json preview/serve.ts` (port 4173; restart it after editing the pane).
+2. Open it in the built-in browser (`mcp__Claude_Browser__*`) and take a screenshot. Options go in the URL: `?surface=desktop|terminal`, `&open=<agent title>` for the chat, `&plan=0` for no plan, `&cols=40`.
+3. Edit the sample data in `serve.ts` to reproduce a state (asking, stopped, long text, many tasks).
+4. Behaviour (presses, state, Stop) is tested with `claude plugin test .`, not here: the preview's buttons do nothing.
+
+The preview is an approximation: its colours, spacing and element mapping are guesses, not Claude Code's real renderer. Trust it for structure and layout, not pixels. After a visual change, ask the user how the real pane differs from the preview, and ask for a screenshot of the real pane (terminal or Desktop) next to it. A screenshot beats a description. Then fix `serve.ts` too if it was wrong.
+
 ## Rules
 
 - The module has no Node or DOM: everything external goes through `$`.

@@ -1,6 +1,7 @@
 import type { AgentState, AgentStatus, Task } from '../types'
 import { HISTORY_CHARS } from './db'
 import type { HistoryRow, MessageRow, PartRow, PromptRow, Rows } from './db'
+import { formatTokens } from './plan'
 
 const RECENT_CHARS = 120
 const UNKNOWN_LIMIT_MS = 60_000
@@ -14,9 +15,13 @@ const CONTINUES = ['tool-calls', 'unknown']
 export const QUESTION_RULE = `# Questions
 If you are in doubt and cannot go on safely, stop and end your final message with a paragraph that starts with "QUESTION:" at the start of a line, followed by your question, then 2 to 4 short answer options as lines starting with "- ", your recommended one first. Nothing may come after them. Claude's answer arrives as your next message. Never use that marker for anything else.`
 
-// The system part, the rule, then Claude's task, which stays last.
+// Added here, not left to Claude's brief: an agent with no todos has no progress bar and no Tasks list.
+export const PROGRESS_RULE = `# Progress
+Before any other work, call todowrite with your tasks: the numbered tasks in the task section, or 2 to 6 short ones of your own if it lists none. Keep exactly one in_progress, and mark each completed as soon as it is done. The person's progress bar reads these todos.`
+
+// The system part, the rules, then Claude's task, which stays last.
 export const composePrompt = (template: string, task: string) =>
-  [template.trim(), QUESTION_RULE, `# Task\n${task}`].filter(Boolean).join('\n\n')
+  [template.trim(), QUESTION_RULE, PROGRESS_RULE, `# Task\n${task}`].filter(Boolean).join('\n\n')
 
 // The last marker wins: a report may quote an earlier one.
 export const parseQuestion = (text: string): string | undefined => {
@@ -117,13 +122,13 @@ export const isSettled = (task: Task) => task.status === 'completed' || task.sta
 export const progressOf = (tasks: Task[]) => {
   const done = tasks.filter(isSettled).length
   const active = tasks.find(t => t.status === 'in_progress')
-  const percent = tasks.length ? Math.round((100 * (done + (active ? 0.5 : 0))) / tasks.length) : 0
+  const percent = tasks.length ? Math.round((100 * done) / tasks.length) : 0
   const label = (active ?? tasks.find(t => !isSettled(t)) ?? tasks.at(-1))?.content ?? ''
 
   return { done, total: tasks.length, percent, label }
 }
 
-// `████░░░░░░░░░░░░ 1/3 Fix parser`: the task in progress counts as half done.
+// `█████░░░░░░░░░░░ 2/3 Fix parser`: the bar counts settled tasks, the number is the current step.
 export const formatProgress = (tasks: Task[]) => {
   const { done, total, percent, label } = progressOf(tasks)
   const filled = Math.round((BAR_WIDTH * percent) / 100)
@@ -132,7 +137,9 @@ export const formatProgress = (tasks: Task[]) => {
   return `${'█'.repeat(filled)}${'░'.repeat(BAR_WIDTH - filled)} ${step}/${total} ${label}`
 }
 
-export const formatTask = (task: Task) => `${TASK_GLYPHS[task.status] ?? '○'} ${task.content}`
+export const taskGlyph = (task: Task) => TASK_GLYPHS[task.status] ?? '○'
+
+export const formatTask = (task: Task) => `${taskGlyph(task)} ${task.content}`
 
 export type ChatEntry = {
   kind: 'prompt' | 'reply' | 'tool' | 'error' | 'reasoning'
@@ -366,3 +373,90 @@ export const formatCounts = (statuses: AgentStatus[]) =>
     .filter(([count]) => count)
     .map(([count, label]) => `${count} ${label}`)
     .join(' · ')
+
+export const STATE_LABELS: Record<AgentState, string> = {
+  running: 'Running',
+  asking: 'Needs an answer',
+  finished: 'Finished',
+  stopped: 'Stopped',
+  unknown: 'Unknown',
+}
+
+export const thinkingLabel = (text: string, isOpen: boolean) => {
+  const lines = text.split('\n')
+  // Trailing blank lines are not rendered, so they must not inflate the count.
+  while (lines.length && !lines.at(-1)?.trim()) lines.pop()
+  const count = lines.length
+
+  return `${isOpen ? '▾' : '▸'} Thinking · ${count} ${count === 1 ? 'line' : 'lines'}`
+}
+
+export const closingLine = (agent: AgentStatus): string | undefined => {
+  if (agent.state === 'running') return agent.currentTool ? `Working · ${agent.currentTool}` : 'Working'
+  if (agent.state === 'asking' || agent.state === 'unknown') return undefined
+
+  const elapsed = formatElapsed(agent.elapsedMs)
+  const head = agent.state === 'finished' ? `Finished in ${elapsed}` : `Stopped after ${elapsed}`
+  // A zero figure is dropped so a short or free run shows only what it has.
+  const figures = [
+    agent.tokens > 0 ? `${formatTokens(agent.tokens)} tok` : '',
+    agent.cost > 0 ? formatTurnCost(agent.cost) : '',
+  ].filter(Boolean)
+
+  return [head, ...figures].join(' · ')
+}
+
+export const questionParts = (question: string) => {
+  const lines = question.trim().split('\n')
+  const options: string[] = []
+  // The question rule puts its options last, so only a trailing run is a list.
+  while (lines.length && lines.at(-1)?.startsWith('- ')) options.unshift(lines.pop()!.slice(2).trim())
+
+  return { text: lines.join('\n').trim(), options }
+}
+
+// The task text of a composed prompt; a prompt without the rules (send_message, old agents) is returned as is.
+export const promptTask = (text: string) => {
+  const rule = text.indexOf(QUESTION_RULE)
+  const marker = rule < 0 ? -1 : text.indexOf('# Task\n', rule + QUESTION_RULE.length)
+
+  return marker < 0 ? text : text.slice(marker + '# Task\n'.length)
+}
+
+// `Code` takes tab and newline as its only control characters; tool output carries colour codes and `\r`.
+export const codeText = (text: string) =>
+  text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
+
+const HUNK = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/
+const IS_BODY = /^[ +\-\\]/
+
+// Whole, well-formed hunks for the engine's diff view: headers before the first `@@` go, at most `maxLines`
+// body lines stay, a cut-off last line goes, and each header's counts follow the lines kept.
+export const clipDiff = (diff: string, maxLines: number) => {
+  const lines = diff.split('\n')
+  const first = lines.findIndex(line => line.startsWith('@@'))
+  if (first < 0) return lines.slice(0, maxLines).join('\n')
+  const hunks: { head: RegExpMatchArray; body: string[] }[] = []
+  let kept = 0
+  for (const line of lines.slice(first)) {
+    const head = line.match(HUNK)
+    if (head) hunks.push({ head, body: [] })
+    else if (!hunks.length) return diff
+    else if (kept < maxLines) {
+      hunks.at(-1)!.body.push(line)
+      kept += 1
+    } else break
+  }
+  const last = hunks.at(-1)
+  while (last?.body.length && !IS_BODY.test(last.body.at(-1)!)) last.body.pop()
+
+  return hunks
+    .filter(h => h.body.length)
+    .map(({ head, body }) => {
+      const old = body.filter(l => !l.startsWith('+') && !l.startsWith('\\')).length
+      const next = body.filter(l => !l.startsWith('-') && !l.startsWith('\\')).length
+
+      return [`@@ -${head[1]},${old} +${head[2]},${next} @@${head[3]}`, ...body].join('\n')
+    })
+    .join('\n')
+}

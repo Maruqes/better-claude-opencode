@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
+import type { AgentStatus } from '../types'
 import type { MessageRow, PartRow, Rows } from '../hooks/db'
-import { clipText, composePrompt, formatChat, formatProgress, formatPrompts, formatReport, groupChat, isActive, parseQuestion, progressOf, QUESTION_RULE, summarize, wrapRows } from '../hooks/summary'
+import { clipText, codeText, composePrompt, PROGRESS_RULE, formatChat, formatProgress, formatPrompts, formatReport, groupChat, isActive, parseQuestion, progressOf, QUESTION_RULE, summarize, wrapRows, STATE_LABELS, thinkingLabel, closingLine, questionParts, promptTask, clipDiff } from '../hooks/summary'
 
 const ID = 'ses_e547fb5b1ffesqEyfSptqG038W'
 const SESSION = {
@@ -128,9 +129,9 @@ test('the report is compact, and detail adds one line per part', () => {
 
 const task = (status: string, content = 'Task') => ({ content, status })
 
-test('the bar counts settled tasks and half of the one in progress', () => {
+test('the bar counts only settled tasks', () => {
   expect(formatProgress([task('in_progress', 'One'), task('pending'), task('pending'), task('pending')])).toBe(
-    '██░░░░░░░░░░░░░░ 1/4 One',
+    '░░░░░░░░░░░░░░░░ 1/4 One',
   )
   expect(formatProgress([task('completed'), task('cancelled'), task('pending', 'Three'), task('pending')])).toBe(
     '████████░░░░░░░░ 3/4 Three',
@@ -149,11 +150,11 @@ test('todos reach the status and the report; other sessions do not', () => {
   expect(formatReport([ID], withTodos, 5100)).toContain('1/1 One')
 })
 
-test('progressOf handles empty, all done and half credit', () => {
+test('progressOf handles empty, all done and a task in progress', () => {
   expect(progressOf([])).toEqual({ done: 0, total: 0, percent: 0, label: '' })
   expect(progressOf([task('completed', 'A'), task('cancelled', 'B')])).toEqual({ done: 2, total: 2, percent: 100, label: 'B' })
   expect(progressOf([task('completed', 'A'), task('in_progress', 'B'), task('pending', 'C')])).toEqual({
-    done: 1, total: 3, percent: 50, label: 'B',
+    done: 1, total: 3, percent: 33, label: 'B',
   })
   expect(progressOf([task('completed', 'A'), task('pending', 'B')]).label).toBe('B')
 })
@@ -263,8 +264,10 @@ test('parseQuestion reads the last marker at a line start', () => {
 })
 
 test('composePrompt keeps the task last and survives an empty template', () => {
-  expect(composePrompt('SYS\n', 'do it')).toBe(`SYS\n\n${QUESTION_RULE}\n\n# Task\ndo it`)
-  expect(composePrompt('', 'do it')).toBe(`${QUESTION_RULE}\n\n# Task\ndo it`)
+  expect(composePrompt('SYS\n', 'do it')).toBe(`SYS\n\n${QUESTION_RULE}\n\n${PROGRESS_RULE}\n\n# Task\ndo it`)
+  expect(composePrompt('', 'do it')).toBe(`${QUESTION_RULE}\n\n${PROGRESS_RULE}\n\n# Task\ndo it`)
+  // A brief that forgets todos must still get them: the bar and the Tasks list read nothing else.
+  expect(composePrompt('', 'do it')).toContain('call todowrite')
 })
 
 test('formatPrompts labels answers and follow-ups', () => {
@@ -286,4 +289,92 @@ test('formatPrompts labels answers and follow-ups', () => {
 test('wrapRows splits by columns, keeps blank lines and stops at the row limit', () => {
   expect(wrapRows('abcdef\n\ngh', 4, 10)).toEqual(['abcd', 'ef', '', 'gh'])
   expect(wrapRows('a\nb\nc', 4, 2)).toEqual(['a', 'b'])
+})
+
+const status = (extra: Partial<AgentStatus> = {}): AgentStatus => ({
+  id: 'ses_1',
+  title: 'Task',
+  model: '',
+  state: 'finished',
+  startedAt: 0,
+  elapsedMs: 192_000,
+  recent: '',
+  cost: 0.04,
+  tokens: 12_400,
+  ...extra,
+})
+
+test('STATE_LABELS names every state with a human label', () => {
+  expect(STATE_LABELS).toEqual({
+    running: 'Running',
+    asking: 'Needs an answer',
+    finished: 'Finished',
+    stopped: 'Stopped',
+    unknown: 'Unknown',
+  })
+})
+
+test('thinkingLabel toggles the caret and counts lines', () => {
+  const twelve = Array.from({ length: 12 }, () => 'line').join('\n')
+  expect(thinkingLabel(twelve, false)).toBe('▸ Thinking · 12 lines')
+  expect(thinkingLabel(twelve, true)).toBe('▾ Thinking · 12 lines')
+})
+
+test('thinkingLabel uses the singular and ignores trailing blank lines', () => {
+  expect(thinkingLabel('only', false)).toBe('▸ Thinking · 1 line')
+  expect(thinkingLabel('only\n\n\n', true)).toBe('▾ Thinking · 1 line')
+  expect(thinkingLabel('a\nb\n', false)).toBe('▸ Thinking · 2 lines')
+})
+
+test('closingLine shows the full figures for finished and stopped agents', () => {
+  expect(closingLine(status({ state: 'finished' }))).toBe('Finished in 3m12s · 12.4k tok · $0.04')
+  expect(closingLine(status({ state: 'stopped' }))).toBe('Stopped after 3m12s · 12.4k tok · $0.04')
+})
+
+test('closingLine omits zero figures, an absent tool and states with nothing to close', () => {
+  expect(closingLine(status({ cost: 0 }))).toBe('Finished in 3m12s · 12.4k tok')
+  expect(closingLine(status({ tokens: 0 }))).toBe('Finished in 3m12s · $0.04')
+  expect(closingLine(status({ state: 'running', currentTool: 'read' }))).toBe('Working · read')
+  expect(closingLine(status({ state: 'running' }))).toBe('Working')
+  expect(closingLine(status({ state: 'asking' }))).toBeUndefined()
+  expect(closingLine(status({ state: 'unknown' }))).toBeUndefined()
+})
+
+test('questionParts splits trailing option lines from the text', () => {
+  expect(questionParts('which db?\n- sqlite\n- pg')).toEqual({ text: 'which db?', options: ['sqlite', 'pg'] })
+  expect(questionParts('  which db?  \n\n- sqlite\n- pg  ')).toEqual({ text: 'which db?', options: ['sqlite', 'pg'] })
+})
+
+test('questionParts keeps a plain question with no options', () => {
+  expect(questionParts('which db?\nsqlite or pg')).toEqual({ text: 'which db?\nsqlite or pg', options: [] })
+  expect(questionParts('just one line')).toEqual({ text: 'just one line', options: [] })
+})
+
+test('promptTask returns the task after the rules, or the text unchanged', () => {
+  expect(promptTask(composePrompt('System', 'Fix it\n# Task\nnested'))).toBe('Fix it\n# Task\nnested')
+  expect(promptTask('# Task\nno rules here')).toBe('# Task\nno rules here')
+  expect(promptTask('Just a follow-up')).toBe('Just a follow-up')
+})
+
+test('clipDiff drops file headers and recounts hunks cut mid-way', () => {
+  const diff = ['Index: a', '===', '--- a', '+++ b', '@@ -1,9 +1,9 @@ fn', ' one', '-two', '+TWO', ' three', ' four'].join('\n')
+  expect(clipDiff(diff, 20)).toBe(['@@ -1,4 +1,4 @@ fn', ' one', '-two', '+TWO', ' three', ' four'].join('\n'))
+  expect(clipDiff(diff, 3)).toBe(['@@ -1,2 +1,2 @@ fn', ' one', '-two', '+TWO'].join('\n'))
+  // A trailing line cut mid-way (no marker) goes.
+  expect(clipDiff('@@ -1,2 +1,2 @@\n a\n+b\nrest of a cut li', 20)).toBe('@@ -1,1 +1,2 @@\n a\n+b')
+})
+
+test('clipDiff keeps several hunks within one line budget and passes hunkless input through', () => {
+  const diff = '@@ -1,1 +1,1 @@\n-a\n+b\n@@ -9,1 +9,3 @@\n x\n+y\n+z'
+  expect(clipDiff(diff, 20)).toBe('@@ -1,1 +1,1 @@\n-a\n+b\n@@ -9,1 +9,3 @@\n x\n+y\n+z')
+  expect(clipDiff(diff, 3)).toBe('@@ -1,1 +1,1 @@\n-a\n+b\n@@ -9,1 +9,1 @@\n x')
+  expect(clipDiff('--- a\n+++ b\n+line', 20)).toBe('--- a\n+++ b\n+line')
+})
+
+test('clipDiff caps a diff with no hunks', () => {
+  expect(clipDiff('a\nb\nc', 2)).toBe('a\nb')
+})
+
+test('codeText keeps tab and newline and drops colour codes and other control characters', () => {
+  expect(codeText('\x1b[31mred\x1b[0m\tok\r\nnext\x07\rend')).toBe('red\tok\nnext\nend')
 })

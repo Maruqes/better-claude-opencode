@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { endsAtBottom } from '../hooks/register'
+import { composePrompt } from '../hooks/summary'
 
 const PANE = {
   plugin: 'opencode-agent-monitor',
@@ -70,10 +71,17 @@ test('Stop calls the MCP and tells Claude; a failure warns', async ($, hook) => 
   const stops: unknown[] = []
   const notes: any[] = []
   let isError = false
+  let denied = false
   seed(on, [agent('ses_r', 'running')])
-  on('mcp.call', (_: unknown, e: unknown) => {
+  on('tool.call', { tool: `${TOOL}stop` }, (_: unknown, e: unknown) => {
     stops.push(e)
-    return { value: { content: [{ type: 'text', text: 'nope' }], isError } }
+    if (denied) return { deny: 'auto mode refused' }
+    return { result: 'nope', text: 'nope', isError }
+  })
+  const asked: string[] = []
+  on('prompt.submit', (_: unknown, e: { text: string }) => {
+    asked.push(e.text)
+    return { text: e.text }
   })
   on('session.append', (_: unknown, e: unknown, next: (e: unknown) => unknown) => {
     notes.push(e)
@@ -88,7 +96,8 @@ test('Stop calls the MCP and tells Claude; a failure warns', async ($, hook) => 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'stop-ses_r' })
   expect(JSON.stringify(stops[0])).toContain('ses_r')
-  expect(JSON.stringify(stops[0])).toContain('plugin:opencode-subagent-mcp:opencode')
+  expect((stops[0] as any).tool).toBe(`${TOOL}stop`)
+  expect((stops[0] as any).consent).toContain('pressed Stop on opencode agent ses_r')
   expect(JSON.stringify(notes[0])).toContain('user stopped opencode agent ses_r')
 
   isError = true
@@ -98,9 +107,35 @@ test('Stop calls the MCP and tells Claude; a failure warns', async ($, hook) => 
   expect(failed.key).toBe('stopError')
 
   isError = false
+  denied = true
+  await ui.press({ key: 'stop-ses_r' })
+  expect(notes.length).toBe(1)
+  expect(asked[0]).toContain('Stop that agent now')
+  expect(asked[0]).toContain('ses_r')
+  expect(writes.at(-1).value).toBe('')
+
+  denied = false
   await ui.press({ key: 'stop-ses_r' })
   expect(writes.at(-1).key).toBe('stopError')
   expect(writes.at(-1).value).toBe('')
+  await ui.unmount()
+})
+
+test("only the pressed agent's own pane call is allowed past the permission check", async ($, hook) => {
+  const on = hook as any
+  seed(on, [agent('ses_r', 'running')])
+  const verdicts: Record<string, string> = {}
+  on('tool.check', () => ({ decision: 'ask' }))
+  on('tool.call', { tool: `${TOOL}stop` }, async (_: unknown, e: any) => {
+    verdicts.other = (await $.tool.check({ tool: `${TOOL}stop`, input: { agent_id: 'ses_x' } })).decision
+    return { result: 'ok', text: 'ok' }
+  })
+  on('session.append', () => ({}))
+  on('state.set', () => ({ value: { isSet: true, version: 2 } }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'stop-ses_r' })
+  expect(verdicts.other).not.toBe('allow')
+  expect((await $.tool.check({ tool: `${TOOL}stop`, input: { agent_id: 'ses_r' } })).decision).not.toBe('allow')
   await ui.unmount()
 })
 
@@ -328,7 +363,7 @@ test('the progress bar is a filled track on every surface, with a gap between th
     const ui = await $.ui.mount({ ...PANE, surface })
     const bar = await ui.find({ key: 'bar-ses_r' })
 
-    expect(JSON.stringify(bar)).toContain(surface === 'terminal' ? '"75%"' : '75% done')
+    expect(JSON.stringify(bar)).toContain(surface === 'terminal' ? '"50%"' : '50% done')
     expect((await ui.find({ type: 'Text', text: /1\/2/ }))?.text).toBe('· deepseek-flash · 1m12s · 1/2')
     expect(JSON.stringify(await ui.findAll({ type: 'Text', text: /^[*█░]+$/ }))).toBe('[]')
     const open = await ui.find({ key: 'open-ses_r' })
@@ -383,9 +418,9 @@ test('Open shows the task list and the chat in order; Close hides them', async (
   expect(await shown(/hidden/)).toEqual(['Earlier activity hidden · showing the latest 3'])
   // The chat owns the pane: the header says what runs, the checklist waits behind its button.
   expect(await shown(/^opencode agents/)).toEqual([])
-  expect(await shown(/● Fix it/)).toEqual([])
+  expect(await shown(/^Fix it$/)).toEqual([])
   const inBand = async (t: RegExp) => {
-    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as any)
+    const ui = await $.ui.mount({ ...BAND, surface: 'desktop' } as any)
     const found = await ui.findAll({ type: 'Text', text: t } as any)
     await ui.unmount()
 
@@ -395,10 +430,10 @@ test('Open shows the task list and the chat in order; Close hides them', async (
   // The harness has no ui.scroll implementation: the call is denied, and the pane goes on without a warning.
   expect(await shown(/^!/)).toEqual([])
 
-  await press('tasks')
-  expect(await shown(/● Fix it/)).toEqual(['● Fix it'])
-  await press('tasks')
-  expect(await shown(/● Fix it/)).toEqual([])
+  await press('tasks', BAND)
+  expect(await inBand(/^Fix it$/)).toEqual(['Fix it', 'Fix it'])
+  await press('tasks', BAND)
+  expect(await inBand(/^Fix it$/)).toEqual(['Fix it'])
 
   await press('back')
   expect(await shown(/^bash/)).toEqual([])
@@ -429,7 +464,8 @@ test('tool runs fold behind one line, a long prompt behind Show more, and the he
   // Running, so the latest step stays visible under its folded run.
   expect(((await mounted(ui => ui.find({ key: 'steps-1' }))) as any).props.label).toMatch(/^▸ 2 steps: read, edit/)
   expect(await mounted(ui => ui.findAll({ type: 'Text', text: /^(read|edit)  x/ }))).toHaveLength(1)
-  expect((await mounted(ui => ui.find({ key: 'chat-header' })))?.props.top).toBe(7)
+  // Nothing is placed from the window's offset: that is what trailed the scroll on desktop.
+  expect(await mounted(ui => ui.find({ key: 'chat-header' }))).toBeUndefined()
   await mounted(ui => ui.press({ key: 'steps-1' }))
   expect(await mounted(ui => ui.findAll({ type: 'Text', text: /^(read|edit)  x/ }))).toHaveLength(2)
   expect(((await mounted(ui => ui.find({ key: 'steps-1' }))) as any).props.label).toMatch(/^▾ 2 steps/)
@@ -460,7 +496,7 @@ test('Jump to latest shows once the person scrolls up, and pressing it resumes f
   await tick()
   await open.unmount()
   const jump = async () => {
-    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const ui = await $.ui.mount({ ...BAND, surface: 'desktop' } as any)
     const found = await ui.find({ key: 'jump-latest' })
     if (found) await ui.press({ key: 'jump-latest' })
     await tick()
@@ -568,7 +604,7 @@ test('the band shows the open agent header with working buttons, and nothing oth
     if (e.key === 'openAgent') opened = e.value
     return { value: { isSet: true, version: 1 } }
   })
-  for (const surface of ['terminal'] as const) {
+  for (const surface of ['terminal', 'desktop'] as const) {
     opened = ''
     const closed = await $.ui.mount({ ...BAND, surface })
     expect(await closed.find({ key: 'back' })).toBeUndefined()
@@ -587,28 +623,51 @@ test('the band shows the open agent header with working buttons, and nothing oth
   }
 })
 
-test('every surface but the terminal pins the header in the pane', async ($, on) => {
+test('the pane keeps a header only where no band can, and desktop a way back', async ($, on) => {
   seed(on, [agent('ses_h', 'running', { tasks: taskPair })], undefined, undefined, { openAgent: 'ses_h' })
   for (const surface of ['vscode', 'mobile', 'terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(!!(await ui.find({ key: 'back' }))).toBe(surface !== 'terminal')
+    expect(!!(await ui.find({ key: 'tasks' }))).toBe(surface === 'vscode' || surface === 'mobile')
     await ui.unmount()
   }
 })
 
-test('open tasks render as full-text wrapping cards in the page, not the header', async ($, on) => {
+test('the header status line leads with the coloured state, effort, then the dim live details', async ($, on) => {
+  seed(on, [agent('ses_h', 'running', { tasks: taskPair, currentTool: 'bash' })], undefined, undefined, { openAgent: 'ses_h' })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    const state = (await ui.find({ type: 'Text', text: /^. Running$/i })) as any
+    expect(state).toBeDefined()
+    expect(state.props.color).toBeDefined()
+    const rest = (await ui.findAll({ type: 'Text', text: /1m12s · bash · deepseek-flash/ })) as any[]
+    expect(rest.length).toBeGreaterThan(0)
+    expect(rest[0].props.dimColor).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('open tasks render as a flat checklist of glyph rows under the header, wherever it is drawn', async ($, on) => {
   const long = 'Rewrite the whole parser so that every long task description stays fully readable '.repeat(3).trim()
   seed(on, [agent('ses_h', 'running', { tasks: [{ content: long, status: 'in_progress' }] })], undefined, undefined, {
     openAgent: 'ses_h',
     chatView: { shape: 'chat-view-2', value: { isTasksOpen: true, expanded: [] } },
   })
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ ...PANE, surface })
-    const t = (await ui.find({ type: 'Text', text: /Rewrite the whole parser/ })) as any
+  for (const [site, surface] of [[BAND, 'terminal'], [BAND, 'desktop'], [PANE, 'vscode']] as const) {
+    const ui = await $.ui.mount({ ...site, surface } as any)
+    // The header's current-task line matches first and truncates: the card is the last match.
+    const t = (await ui.findAll({ type: 'Text', text: /Rewrite the whole parser/ })).at(-1) as any
     expect(t.text).toContain(long)
     expect(t.props.wrap).toBe('wrap')
+    expect(t.props.bold).toBe(true)
+    expect(t.text).not.toMatch(/^●/)
+    expect(await ui.find({ type: 'Text', text: /^●$/ })).toBeDefined()
     await ui.unmount()
   }
+  // The band's list must not leave a second copy out of view in the desktop pane.
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await pane.find({ type: 'Text', text: /Rewrite the whole parser/ })).toBeUndefined()
+  await pane.unmount()
 })
 
 test('the chat view shows the prompt path', async ($, on) => {
@@ -796,7 +855,7 @@ test('the chat draws a turn line, collapsible reasoning and tool output/diffs', 
               id: 'tool-p',
               messageId: 'a1',
               output: 'alpha\nbeta',
-              diff: '--- a\n+++ b\n+line',
+              diff: '--- a\n+++ b\n@@ -1,1 +1,2 @@\n keep\n+line',
             },
             { kind: 'reply', text: 'Done', messageId: 'a1' },
           ],
@@ -808,13 +867,13 @@ test('the chat draws a turn line, collapsible reasoning and tool output/diffs', 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const text = async (t: RegExp) => (await ui.find({ type: 'Text', text: t }))?.text
 
-  expect(await text(/Turn 1/)).toBe('── Turn 1 · 12s · 1.2k tok · $0.004 ──')
+  expect(await text(/Turn 1/)).toBe('Turn 1 · 12s · 1.2k tok · $0.004')
   expect(await ui.find({ key: 'thinking-reasoning-r' })).toBeDefined()
-  expect((await ui.find({ key: 'thinking-reasoning-r' }))?.props.label).toBe('Thinking ↓')
+  expect((await ui.find({ key: 'thinking-reasoning-r' }))?.props.label).toBe('▾ Thinking · 2 lines')
   expect(await text(/^Why/)).toBe('Why\nbecause')
-  expect(await text(/^alpha$/)).toBe('alpha')
-  expect(await text(/^beta$/)).toBe('beta')
-  expect((await ui.find({ type: 'Text', text: /^\+line/ }))?.props.color).toBe('success')
+  const code = await ui.findAll({ type: 'Code' })
+  expect(code.map((c: any) => c.props.source)).toEqual(['alpha\nbeta', '@@ -1,1 +1,2 @@\n keep\n+line'])
+  expect(code[1]?.props.format).toBe('diff')
   await ui.unmount()
 })
 
@@ -835,6 +894,62 @@ test('the plan view renders on every surface and at a narrow width', async ($, o
     expect((await ui.find({ type: 'Text', text: /^Ride Verdict MVP/ }))?.text).toBe('Ride Verdict MVP')
     expect((await ui.find({ type: 'Text', text: /^Planned/ }))?.text).toBe('Planned · 3 · 0 done')
     expect(await ui.find({ key: 'stat-cost' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+const PROMPT_TEXT = composePrompt('System', 'Fix the parser')
+const chatOf = (entries: object[], extra: Record<string, unknown> = {}) => ({
+  openAgent: 'ses_a',
+  prompts: { shape: 'prompts-1', value: ['ses_a'] },
+  history: { shape: 'history-3', value: { id: 'ses_a', total: entries.length, entries } },
+  chatView: { shape: 'chat-view-2', value: { isTasksOpen: false, expanded: [] } },
+  ...extra,
+})
+
+test('the chat shows the task, the prompt path under it, and the closing line', async ($, on) => {
+  seed(on, [agent('ses_a', 'finished', { elapsedMs: 72000, tokens: 1200 })], undefined, undefined, chatOf([
+    { kind: 'prompt', text: PROMPT_TEXT },
+    { kind: 'reply', text: 'Done' },
+  ]))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const texts = (await ui.findAll({ type: 'Text' })).map((t: any) => t.text)
+
+    expect(texts).toContain('Fix the parser')
+    expect(texts.some((t: string) => t.includes('# Questions'))).toBe(false)
+    expect(texts.indexOf('Fix the parser') + 1).toBe(texts.indexOf('.opencode-monitor/ses_a/prompt.txt'))
+    expect(texts).toContain('Finished in 1m12s · 1.2k tok')
+    expect(await ui.find({ key: 'closing' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('the chat waits for activity, and keeps the prompt path before any prompt', async ($, on) => {
+  seed(on, [agent('ses_a', 'running')], undefined, undefined, chatOf([]))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  expect((await ui.find({ type: 'Text', text: /Waiting/ }))?.text).toBe("Waiting for the agent's first activity")
+  expect((await ui.find({ type: 'Text', text: /prompt\.txt/ }))?.text).toBe('.opencode-monitor/ses_a/prompt.txt')
+  expect((await ui.find({ key: 'closing' }))).toBeDefined()
+  await ui.unmount()
+})
+
+test('an asking agent draws its question once, with options, and the reply stops before the marker', async ($, on) => {
+  const question = 'Which db?\n- sqlite\n- postgres'
+  seed(on, [agent('ses_a', 'asking', { question })], undefined, undefined, chatOf([
+    { kind: 'reply', text: `Some notes\n\nQUESTION: ${question}` },
+    { kind: 'reply', text: `QUESTION: ${question}` },
+  ]))
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const block = await ui.find({ key: 'question' })
+
+    expect(block).toBeDefined()
+    expect((await ui.findAll({ type: 'Markdown' })).map((m: any) => m.props.text)).toEqual(['Some notes\n\nQUESTION: ' + question, 'Which db?'])
+    expect((await ui.find({ type: 'Text', text: /^Needs an answer/ }))?.props.color).toBe('warning')
+    expect((await ui.find({ type: 'Text', text: /^- ?sqlite|^sqlite/ }))?.text).toContain('sqlite')
+    expect((await ui.find({ type: 'Text', text: /recommended/ }))).toBeDefined()
     await ui.unmount()
   }
 })
